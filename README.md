@@ -1,7 +1,9 @@
 # DR.Nav — Dead-End Risk-Aware Navigation
 
 **DR.Nav** is a ROS 2 navigation system that uses RGB-LiDAR sensor fusion and a deep learning model to predict dead ends proactively and recover from them autonomously. The system operates in both mapless (exploration) and map-based (structured) environments.
+
 ![DR.Nav Architecture](images/DRaM-arch.png)
+
 ---
 
 ## Table of Contents
