@@ -318,102 +318,102 @@ class GoalGenerator(Node):
         
         return 1.0 / max(min_dist, 0.1)  # Avoid division by zero
 
-    # def compute_j_geom(self, start_x: float, start_y: float, heading: float, distance: float) -> Tuple[float, bool]:
-    #     """
-    #     Compute J_geom(θ) - geometric cost components (identical for all methods)
+    def compute_j_geom(self, start_x: float, start_y: float, heading: float, distance: float) -> Tuple[float, bool]:
+        """
+        Compute J_geom(θ) - geometric cost components (identical for all methods)
         
-    #     Returns:
-    #         (j_geom_score, is_feasible)
-    #     """
-    #     collision_cost = 0.0
-    #     feasible = True
-    #     actual_distance = distance
+        Returns:
+            (j_geom_score, is_feasible)
+        """
+        collision_cost = 0.0
+        feasible = True
+        actual_distance = distance
         
-    #     # Sample points along the ray
-    #     num_samples = int(distance / self.ray_resolution)
+        # Sample points along the ray
+        num_samples = int(distance / self.ray_resolution)
         
-    #     for i in range(1, num_samples + 1):
-    #         # Calculate point along ray
-    #         sample_distance = i * self.ray_resolution
-    #         sample_x = start_x + sample_distance * math.cos(heading)
-    #         sample_y = start_y + sample_distance * math.sin(heading)
+        for i in range(1, num_samples + 1):
+            # Calculate point along ray
+            sample_distance = i * self.ray_resolution
+            sample_x = start_x + sample_distance * math.cos(heading)
+            sample_y = start_y + sample_distance * math.sin(heading)
             
-    #         # Feasibility: check if ray hits obstacle before R
-    #         if self.is_point_occupied(sample_x, sample_y):
-    #             feasible = False
-    #             actual_distance = sample_distance
-    #             break
+            # Feasibility: check if ray hits obstacle before R
+            if self.is_point_occupied(sample_x, sample_y):
+                feasible = False
+                actual_distance = sample_distance
+                break
             
-    #         # Collision/clearance cost: integral of inflated costmap + clearance
-    #         costmap_val = self.get_costmap_value(sample_x, sample_y)
-    #         clearance_cost = self.get_clearance_cost(sample_x, sample_y)
-    #         collision_cost += (costmap_val / 100.0 + clearance_cost) * self.ray_resolution
+            # Collision/clearance cost: integral of inflated costmap + clearance
+            costmap_val = self.get_costmap_value(sample_x, sample_y)
+            clearance_cost = self.get_clearance_cost(sample_x, sample_y)
+            collision_cost += (costmap_val / 100.0 + clearance_cost) * self.ray_resolution
         
-    #     # Feasibility penalty: huge penalty if blocked before R
-    #     feasibility_cost = self.feasibility_weight if not feasible else 0.0
+        # Feasibility penalty: huge penalty if blocked before R
+        feasibility_cost = self.feasibility_weight if not feasible else 0.0
         
-    #     # Smoothness: yaw change penalty to avoid twitch
-    #     yaw_change = abs(heading - self.last_robot_yaw)
-    #     yaw_change = min(yaw_change, 2 * math.pi - yaw_change)  # Wrap to [-π, π]
-    #     smoothness_cost = self.smoothness_weight * yaw_change
+        # Smoothness: yaw change penalty to avoid twitch
+        yaw_change = abs(heading - self.last_robot_yaw)
+        yaw_change = min(yaw_change, 2 * math.pi - yaw_change)  # Wrap to [-π, π]
+        smoothness_cost = self.smoothness_weight * yaw_change
         
-    #     # Range bias: light penalty for very short rays
-    #     range_bias_cost = self.range_bias_weight * max(0, self.horizon_distance - actual_distance)
+        # Range bias: light penalty for very short rays
+        range_bias_cost = self.range_bias_weight * max(0, self.horizon_distance - actual_distance)
         
-    #     # Total J_geom
-    #     j_geom = (self.collision_weight * collision_cost + 
-    #               feasibility_cost + 
-    #               smoothness_cost + 
-    #               range_bias_cost)
+        # Total J_geom
+        j_geom = (self.collision_weight * collision_cost + 
+                  feasibility_cost + 
+                  smoothness_cost + 
+                  range_bias_cost)
         
-    #     return j_geom, feasible
+        return j_geom, feasible
 
-    # def compute_ede(self, start_x: float, start_y: float, heading: float, distance: float) -> float:
-    #     """
-    #     Compute EDE(θ) - Exposure to Dead-End (for DRaM methods only)
-    #     EDE(θ) = Σᵢ pᵢ·Δs where pᵢ is dead-end probability, Δs is segment length
-    #     """
-    #     if self.lambda_ede == 0.0:
-    #         return 0.0  # LiDAR methods don't use EDE
+    def compute_ede(self, start_x: float, start_y: float, heading: float, distance: float) -> float:
+        """
+        Compute EDE(θ) - Exposure to Dead-End (for DRaM methods only)
+        EDE(θ) = Σᵢ pᵢ·Δs where pᵢ is dead-end probability, Δs is segment length
+        """
+        if self.lambda_ede == 0.0:
+            return 0.0  # LiDAR methods don't use EDE
         
-    #     ede_score = 0.0
-    #     num_samples = int(distance / self.ray_resolution)
+        ede_score = 0.0
+        num_samples = int(distance / self.ray_resolution)
         
-    #     for i in range(1, num_samples + 1):
-    #         # Calculate point along ray
-    #         sample_distance = i * self.ray_resolution
-    #         sample_x = start_x + sample_distance * math.cos(heading)
-    #         sample_y = start_y + sample_distance * math.sin(heading)
+        for i in range(1, num_samples + 1):
+            # Calculate point along ray
+            sample_distance = i * self.ray_resolution
+            sample_x = start_x + sample_distance * math.cos(heading)
+            sample_y = start_y + sample_distance * math.sin(heading)
             
-    #         # Stop at obstacles
-    #         if self.is_point_occupied(sample_x, sample_y):
-    #             break
+            # Stop at obstacles
+            if self.is_point_occupied(sample_x, sample_y):
+                break
             
-    #         # Bilinear sample risk probability p_i ∈ [0,1]
-    #         risk_prob = self.bilinear_sample_risk(sample_x, sample_y)
+            # Bilinear sample risk probability p_i ∈ [0,1]
+            risk_prob = self.bilinear_sample_risk(sample_x, sample_y)
             
-    #         # Accumulate EDE: p_i * Δs
-    #         ede_score += risk_prob * self.ray_resolution
+            # Accumulate EDE: p_i * Δs
+            ede_score += risk_prob * self.ray_resolution
         
-    #     return ede_score
+        return ede_score
 
-    # def compute_unified_score(self, start_x: float, start_y: float, heading: float) -> Tuple[float, bool]:
-    #     """
-    #     Compute unified score: Score(θ) = J_geom(θ) + λ·EDE(θ)
+    def compute_unified_score(self, start_x: float, start_y: float, heading: float) -> Tuple[float, bool]:
+        """
+        Compute unified score: Score(θ) = J_geom(θ) + λ·EDE(θ)
         
-    #     Returns:
-    #         (total_score, is_feasible)
-    #     """
-    #     # Compute geometric cost (same for all methods)
-    #     j_geom, feasible = self.compute_j_geom(start_x, start_y, heading, self.horizon_distance)
+        Returns:
+            (total_score, is_feasible)
+        """
+        # Compute geometric cost (same for all methods)
+        j_geom, feasible = self.compute_j_geom(start_x, start_y, heading, self.horizon_distance)
         
-    #     # Compute EDE (only for DRaM methods when λ > 0)
-    #     ede = self.compute_ede(start_x, start_y, heading, self.horizon_distance)
+        # Compute EDE (only for DRaM methods when λ > 0)
+        ede = self.compute_ede(start_x, start_y, heading, self.horizon_distance)
         
-    #     # Unified score
-    #     total_score = j_geom + self.lambda_ede * ede
+        # Unified score
+        total_score = j_geom + self.lambda_ede * ede
         
-    #     return total_score, feasible
+        return total_score, feasible
 
     def sample_exploration_waypoint(self) -> Optional[Tuple[float, float, float]]:
         """
@@ -463,98 +463,98 @@ class GoalGenerator(Node):
         self.get_logger().debug(f'✅ Best ray: θ={best_heading:.2f}rad, score={best_score:.1f}, feasible={feasible_rays}/{self.num_rays}')
         return best_waypoint
 
-    # def compute_recovery_score(self, candidate_x: float, candidate_y: float) -> float:
-    #     """
-    #     Compute recovery score using shared α,β,γ,δ parameters
-    #     RecScore = α·goal-progress + β·clearance - γ·slope/roughness - δ·EDE_from_here
-    #     """
-    #     if self.robot_pose is None:
-    #         return float('inf')
+    def compute_recovery_score(self, candidate_x: float, candidate_y: float) -> float:
+        """
+        Compute recovery score using shared α,β,γ,δ parameters
+        RecScore = α·goal-progress + β·clearance - γ·slope/roughness - δ·EDE_from_here
+        """
+        if self.robot_pose is None:
+            return float('inf')
         
-    #     robot_x, robot_y, robot_yaw = self.robot_pose
+        robot_x, robot_y, robot_yaw = self.robot_pose
         
-    #     # α·goal-progress (assume goal is forward exploration for now)
-    #     forward_x = robot_x + math.cos(robot_yaw)
-    #     forward_y = robot_y + math.sin(robot_yaw)
-    #     progress = -math.hypot(candidate_x - forward_x, candidate_y - forward_y)  # Negative = closer is better
-    #     goal_progress_term = self.alpha_progress * progress
+        # α·goal-progress (assume goal is forward exploration for now)
+        forward_x = robot_x + math.cos(robot_yaw)
+        forward_y = robot_y + math.sin(robot_yaw)
+        progress = -math.hypot(candidate_x - forward_x, candidate_y - forward_y)  # Negative = closer is better
+        goal_progress_term = self.alpha_progress * progress
         
-    #     # β·clearance (distance to nearest obstacle)
-    #     clearance = 1.0 / max(self.get_clearance_cost(candidate_x, candidate_y), 0.1)
-    #     clearance_term = self.beta_clearance * clearance
+        # β·clearance (distance to nearest obstacle)
+        clearance = 1.0 / max(self.get_clearance_cost(candidate_x, candidate_y), 0.1)
+        clearance_term = self.beta_clearance * clearance
         
-    #     # γ·slope/roughness (simplified as distance penalty)
-    #     distance_to_candidate = math.hypot(candidate_x - robot_x, candidate_y - robot_y)
-    #     roughness_term = self.gamma_roughness * distance_to_candidate
+        # γ·slope/roughness (simplified as distance penalty)
+        distance_to_candidate = math.hypot(candidate_x - robot_x, candidate_y - robot_y)
+        roughness_term = self.gamma_roughness * distance_to_candidate
         
-    #     # δ·EDE_from_here (only for DRaM methods)
-    #     if self.lambda_ede > 0.0:
-    #         # Sample a few directions from recovery point to estimate EDE
-    #         ede_from_recovery = 0.0
-    #         test_directions = 8
-    #         for i in range(test_directions):
-    #             test_heading = (2 * math.pi * i) / test_directions
-    #             ede_from_recovery += self.compute_ede(candidate_x, candidate_y, test_heading, 2.0)  # 2m horizon
-    #         ede_from_recovery /= test_directions
-    #         ede_term = self.delta_ede_recovery * ede_from_recovery
-    #     else:
-    #         ede_term = 0.0
+        # δ·EDE_from_here (only for DRaM methods)
+        if self.lambda_ede > 0.0:
+            # Sample a few directions from recovery point to estimate EDE
+            ede_from_recovery = 0.0
+            test_directions = 8
+            for i in range(test_directions):
+                test_heading = (2 * math.pi * i) / test_directions
+                ede_from_recovery += self.compute_ede(candidate_x, candidate_y, test_heading, 2.0)  # 2m horizon
+            ede_from_recovery /= test_directions
+            ede_term = self.delta_ede_recovery * ede_from_recovery
+        else:
+            ede_term = 0.0
         
-    #     # Total recovery score (lower is better)
-    #     rec_score = goal_progress_term + clearance_term - roughness_term - ede_term
-    #     return -rec_score  # Negate so higher is better, then we take min
+        # Total recovery score (lower is better)
+        rec_score = goal_progress_term + clearance_term - roughness_term - ede_term
+        return -rec_score  # Negate so higher is better, then we take min
 
-    # def select_recovery_waypoint(self) -> Optional[Tuple[float, float, float]]:
-    #     """
-    #     Select recovery waypoint from candidate set (behind & to the sides)
-    #     If no recovery points available, generate candidates behind robot
-    #     """
-    #     if self.robot_pose is None:
-    #         return None
+    def select_recovery_waypoint(self) -> Optional[Tuple[float, float, float]]:
+        """
+        Select recovery waypoint from candidate set (behind & to the sides)
+        If no recovery points available, generate candidates behind robot
+        """
+        if self.robot_pose is None:
+            return None
         
-    #     robot_x, robot_y, robot_yaw = self.robot_pose
-    #     candidates = []
+        robot_x, robot_y, robot_yaw = self.robot_pose
+        candidates = []
         
-    #     # Use recovery points if available (DRaM methods)
-    #     if self.recovery_points:
-    #         for rp in self.recovery_points:
-    #             candidates.append((rp['x'], rp['y']))
-    #     else:
-    #         # Generate recovery candidates behind & to the sides (LiDAR methods)
-    #         recovery_distance = 2.0  # meters behind
-    #         recovery_angles = [math.pi, 3*math.pi/4, 5*math.pi/4, math.pi/2, -math.pi/2]  # Behind, diagonals, sides
+        # Use recovery points if available (DRaM methods)
+        if self.recovery_points:
+            for rp in self.recovery_points:
+                candidates.append((rp['x'], rp['y']))
+        else:
+            # Generate recovery candidates behind & to the sides (LiDAR methods)
+            recovery_distance = 2.0  # meters behind
+            recovery_angles = [math.pi, 3*math.pi/4, 5*math.pi/4, math.pi/2, -math.pi/2]  # Behind, diagonals, sides
             
-    #         for angle_offset in recovery_angles:
-    #             candidate_heading = robot_yaw + angle_offset
-    #             candidate_x = robot_x + recovery_distance * math.cos(candidate_heading)
-    #             candidate_y = robot_y + recovery_distance * math.sin(candidate_heading)
+            for angle_offset in recovery_angles:
+                candidate_heading = robot_yaw + angle_offset
+                candidate_x = robot_x + recovery_distance * math.cos(candidate_heading)
+                candidate_y = robot_y + recovery_distance * math.sin(candidate_heading)
                 
-    #             # Check if candidate is not occupied
-    #             if not self.is_point_occupied(candidate_x, candidate_y):
-    #                 candidates.append((candidate_x, candidate_y))
+                # Check if candidate is not occupied
+                if not self.is_point_occupied(candidate_x, candidate_y):
+                    candidates.append((candidate_x, candidate_y))
         
-    #     if not candidates:
-    #         return None
+        if not candidates:
+            return None
         
-    #     # Score each candidate and pick best
-    #     best_score = float('inf')
-    #     best_candidate = None
+        # Score each candidate and pick best
+        best_score = float('inf')
+        best_candidate = None
         
-    #     for candidate_x, candidate_y in candidates:
-    #         score = self.compute_recovery_score(candidate_x, candidate_y)
-    #         if score < best_score:
-    #             best_score = score
-    #             best_candidate = (candidate_x, candidate_y)
+        for candidate_x, candidate_y in candidates:
+            score = self.compute_recovery_score(candidate_x, candidate_y)
+            if score < best_score:
+                best_score = score
+                best_candidate = (candidate_x, candidate_y)
         
-    #     if best_candidate:
-    #         # Calculate heading to recovery point
-    #         dx = best_candidate[0] - robot_x
-    #         dy = best_candidate[1] - robot_y
-    #         heading = math.atan2(dy, dx)
+        if best_candidate:
+            # Calculate heading to recovery point
+            dx = best_candidate[0] - robot_x
+            dy = best_candidate[1] - robot_y
+            heading = math.atan2(dy, dx)
             
-    #         return (best_candidate[0], best_candidate[1], heading)
+            return (best_candidate[0], best_candidate[1], heading)
         
-    #     return None
+        return None
 
     def generate_goal_callback(self):
         """

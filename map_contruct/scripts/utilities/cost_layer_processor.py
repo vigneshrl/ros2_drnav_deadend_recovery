@@ -25,6 +25,8 @@ import numpy as np
 import math
 import time
 
+from map_contruct.scripts.utilities.recovery_points import RecoveryPointManager
+
 class BayesianCostLayerProcessor(Node):
     def __init__(self):
         super().__init__('bayesian_cost_layer_processor')
@@ -79,9 +81,13 @@ class BayesianCostLayerProcessor(Node):
         self.sector_angle = np.pi / 3  # 60 degrees per sector (adjustable)
         self.max_history_age = 30.0  # Keep cost data for 30 seconds
         
-        # Recovery points storage with type information
-        self.recovery_points = []  # List of {'x': float, 'y': float, 'type': int, 'timestamp': float}
-        self.max_recovery_age = 60.0  # Keep recovery points for 60 seconds
+        # Recovery point tracking via RecoveryPointManager
+        self.recovery_manager = RecoveryPointManager(
+            confidence_threshold=0.56,
+            max_stored_points=50,
+            min_distance_m=1.0,
+            max_age_s=60.0
+        )
         
         # Current detection results (3 directional outputs)
         self.current_path_status = None  # Raw probabilities
@@ -276,28 +282,21 @@ class BayesianCostLayerProcessor(Node):
             marker_array.markers.append(recovery_marker)
             marker_id += 1
             
-            # Store recovery point with type information
-            # Type 1: 2+ openings (preferred), Type 2: 1 opening (backup)
-            recovery_type = 1 if open_paths_count >= 2 else 2
-            recovery_point = {
-                'x': robot_x,
-                'y': robot_y,
-                'type': recovery_type,
-                'timestamp': current_time,
-                'open_paths': open_paths_count
-            }
-            
-            # Add to recovery points list (avoid duplicates within 1.0 meter)
-            is_duplicate = False
-            for existing in self.recovery_points:
-                if (abs(existing['x'] - robot_x) < 1.0 and 
-                    abs(existing['y'] - robot_y) < 1.0):
-                    is_duplicate = True
-                    break
-            
-            if not is_duplicate:
-                self.recovery_points.append(recovery_point)
-                self.get_logger().info(f'🎯 Saved recovery point Type {recovery_type} at ({robot_x:.2f}, {robot_y:.2f}) with {open_paths_count} openings')
+            # Store recovery point via RecoveryPointManager
+            # (handles deduplication, expiry, and spatial tracking)
+            new_point = self.recovery_manager.process_probabilities(
+                path_probs=list(msg.data),
+                x=robot_x,
+                y=robot_y
+            )
+            if new_point:
+                self.get_logger().info(
+                    f'🎯 Saved recovery point rank={new_point.rank} at '
+                    f'({robot_x:.2f}, {robot_y:.2f}) '
+                    f'open=[F={new_point.open_directions[0]} '
+                    f'L={new_point.open_directions[1]} '
+                    f'R={new_point.open_directions[2]}]'
+                )
         
         # Add center status marker at robot position
         status_marker = Marker()
@@ -423,17 +422,12 @@ class BayesianCostLayerProcessor(Node):
             marker_id += 1
             historical_count += 1
         
-        # Clean up old history
+        # Clean up old cost history
         cutoff_time = current_time - self.max_history_age
-        self.cost_history = {k: v for k, v in self.cost_history.items() 
-                           if v['timestamp'] > cutoff_time}
-        
-        # Clean up old recovery points
-        recovery_cutoff_time = current_time - self.max_recovery_age
-        self.recovery_points = [rp for rp in self.recovery_points 
-                               if rp['timestamp'] > recovery_cutoff_time]
-        
-        # Publish recovery points for the DWA planner
+        self.cost_history = {k: v for k, v in self.cost_history.items()
+                             if v['timestamp'] > cutoff_time}
+
+        # Publish recovery points for goal_generator
         self.publish_recovery_points()
         
         # Publish the marker array
@@ -444,34 +438,32 @@ class BayesianCostLayerProcessor(Node):
         self.get_logger().info(f'📍 Published {marker_id} markers | Current: 3 paths + 1 status + {"1 recovery" if is_recovery_point else "0 recovery"} | Historical: {historical_count} | Status: {status_text}')
 
     def publish_recovery_points(self):
-        """Publish recovery points with type information for DWA planner"""
-        if not self.recovery_points:
+        """Publish recovery points for goal_generator.
+
+        Format: [type, x, y,  type, x, y, ...]
+        Type 1 = rank >= 2 (2+ open directions, preferred)
+        Type 2 = rank == 1 (single open direction, backup)
+        """
+        points = self.recovery_manager.get_all_points()
+        if not points:
             self.get_logger().debug('📍 No recovery points to publish')
             return
-            
-        # Format: [type1, x1, y1, type2, x2, y2, ...] 
-        # Type 1 = 2+ openings (preferred), Type 2 = 1 opening (backup)
+
         recovery_data = []
-        
-        for rp in self.recovery_points:
-            recovery_data.extend([
-                float(rp['type']),  # Recovery point type
-                float(rp['x']),     # X coordinate
-                float(rp['y'])      # Y coordinate
-            ])
-            self.get_logger().info(f'📍 Publishing recovery point: Type {rp["type"]}, ({rp["x"]:.2f}, {rp["y"]:.2f})')
-        
-        # Create and publish message
+        for rp in points:
+            rp_type = 1 if rp.rank >= 2 else 2
+            recovery_data.extend([float(rp_type), float(rp.x), float(rp.y)])
+
         msg = Float32MultiArray()
         msg.data = recovery_data
         self.recovery_points_pub.publish(msg)
-        self.get_logger().info(f'📍 Published {len(self.recovery_points)} recovery points to /dead_end_detection/recovery_points')
-        
-        # Log recovery points summary
-        type1_count = len([rp for rp in self.recovery_points if rp['type'] == 1])
-        type2_count = len([rp for rp in self.recovery_points if rp['type'] == 2])
-        self.get_logger().debug(f'🎯 Published {len(self.recovery_points)} recovery points: '
-                               f'{type1_count} Type-1 (2+ paths), {type2_count} Type-2 (1 path)')
+
+        type1 = sum(1 for rp in points if rp.rank >= 2)
+        type2 = len(points) - type1
+        self.get_logger().info(
+            f'📍 Published {len(points)} recovery points '
+            f'(Type1={type1} rank≥2, Type2={type2} rank=1)'
+        )
 
 def main(args=None):
     rclpy.init(args=args)

@@ -26,9 +26,8 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 from matplotlib import pyplot as plt
 
-# Import your model and recovery points
+# Import model
 from map_contruct.scripts.models.model_CA import DeadEndDetectionModel
-from map_contruct.scripts.utilities.recovery_points import RecoveryPointManager
 
 class DeadEndDetectionNodeWithVisualization(Node):
     def __init__(self):
@@ -78,9 +77,6 @@ class DeadEndDetectionNodeWithVisualization(Node):
             self.get_logger().error(f'❌ Failed to load model: {e}')
             self.model = None
             self.get_logger().warn('⚠️ Using dummy model for testing purposes')
-        
-        # Initialize recovery point manager
-        self.recovery_manager = RecoveryPointManager(confidence_threshold=0.5)
         
         # Initialize transforms - same as training
         self.transform = transforms.Compose([
@@ -140,7 +136,6 @@ class DeadEndDetectionNodeWithVisualization(Node):
         # Initialize publishers
         self.dead_end_pub = self.create_publisher(Bool, '/dead_end_detection/is_dead_end', 10)
         self.path_status_pub = self.create_publisher(Float32MultiArray, '/dead_end_detection/path_status', 10)
-        self.recovery_point_pub = self.create_publisher(Float32MultiArray, '/dead_end_detection/recovery_points', 10)
         
         # Initialize message storage
         self.front_img = None
@@ -527,9 +522,6 @@ class DeadEndDetectionNodeWithVisualization(Node):
             is_dead_end = torch.sigmoid(outputs['is_dead_end']).cpu().numpy().flatten()[0]
             direction_vectors = outputs['direction_vectors'][0]  # Remove batch dimension
             
-            # Process recovery points
-            strategy = self.recovery_manager.get_recovery_strategy(outputs)
-            
             post_processing_time = time.time() - post_processing_start
             self.timing_breakdown['post_processing'].append(post_processing_time)
             
@@ -547,7 +539,7 @@ class DeadEndDetectionNodeWithVisualization(Node):
                 self.save_visualization(path_probs, is_dead_end, direction_vectors, inference_time)
             
             # Publish results
-            self.publish_results(outputs, strategy)
+            self.publish_results(outputs)
             
             # Update counters
             self.frame_count += 1
@@ -746,40 +738,24 @@ class DeadEndDetectionNodeWithVisualization(Node):
         except Exception as e:
             self.get_logger().error(f'❌ Error saving results JSON: {e}')
 
-    def publish_results(self, outputs: Dict[str, torch.Tensor], strategy: dict):
-        """Publish model outputs and recovery points"""
+    def publish_results(self, outputs: Dict[str, torch.Tensor]):
+        """Publish model outputs: path_status and is_dead_end"""
+        # Compute path probabilities
+        path_probs = torch.sigmoid(outputs['path_status']).cpu().numpy().flatten()
+
+        # Compute is_dead_end: all 3 directions blocked below threshold
+        threshold = 0.56
+        is_dead_end = not any(p > threshold for p in path_probs[:3])
+
         # Publish dead end status
         dead_end_msg = Bool()
-        dead_end_msg.data = strategy['is_dead_end']
+        dead_end_msg.data = bool(is_dead_end)
         self.dead_end_pub.publish(dead_end_msg)
-        
-        # Publish path status
-        path_status = torch.sigmoid(outputs['path_status']).cpu().numpy()
+
+        # Publish path status [front, left, right]
         path_msg = Float32MultiArray()
-        path_msg.data = path_status.flatten().tolist()
+        path_msg.data = path_probs.tolist()
         self.path_status_pub.publish(path_msg)
-        
-        # Publish recovery points
-        if strategy['recovery_points']:
-            recovery_msg = Float32MultiArray()
-            recovery_data = []
-            
-            if strategy['recovery_points']['last']:
-                last_point = strategy['recovery_points']['last']
-                recovery_data.extend([
-                    last_point.index, last_point.rank,
-                    *last_point.open_directions, *last_point.confidence
-                ])
-            
-            if strategy['recovery_points']['best']:
-                best_point = strategy['recovery_points']['best']
-                recovery_data.extend([
-                    best_point.index, best_point.rank,
-                    *best_point.open_directions, *best_point.confidence
-                ])
-            
-            recovery_msg.data = recovery_data
-            self.recovery_point_pub.publish(recovery_msg)
 
     def diagnostic_check(self):
         """Periodic diagnostic check"""

@@ -1,229 +1,162 @@
-import numpy as np
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
-from collections import deque
-import torch
+from typing import List, Optional
+import time
+import math
+
 
 @dataclass
 class RecoveryPoint:
-    """Class to store information about a recovery point"""
-    index: int  # Position in the path
-    open_directions: List[int]  # [front, left, right] status (1=open, 0=closed)
-    rank: int  # Number of open directions (1-3)
-    timestamp: float  # When this point was recorded
-    confidence: List[float]  # Model's confidence scores for each direction
+    """Stores a spatial position where the robot had at least one open direction."""
+    x: float                    # Robot x in map frame
+    y: float                    # Robot y in map frame
+    open_directions: List[int]  # [front, left, right] — 1=open, 0=blocked
+    rank: int                   # Number of open directions (1–3)
+    timestamp: float            # When this point was recorded
+    confidence: List[float]     # Raw path probabilities [front, left, right]
+
 
 class RecoveryPointManager:
-    def __init__(self, max_stored_points: int = 2, confidence_threshold: float = 0.5):
+    """
+    Tracks spatial positions where the robot had open paths.
+    Used for dead-end recovery: when all directions are blocked,
+    navigate back to the best stored recovery point.
+
+    Threshold: 0.56 (consistent with infer_vis and cost_layer_processor)
+    """
+
+    def __init__(self,
+                 confidence_threshold: float = 0.56,
+                 max_stored_points: int = 50,
+                 min_distance_m: float = 1.0,
+                 max_age_s: float = 60.0):
         """
-        Initialize the recovery point manager
-        
         Args:
-            max_stored_points: Maximum number of recent recovery points to store
-            confidence_threshold: Threshold for considering a path as open (0-1)
+            confidence_threshold: path probability above which direction is 'open'
+            max_stored_points:    cap on total stored points (oldest dropped first)
+            min_distance_m:       spatial deduplication radius — within this radius,
+                                  only keep the point with the highest rank
+            max_age_s:            expire points older than this many seconds
         """
-        self.recovery_points: List[RecoveryPoint] = []  # All recovery points
-        self.recent_points = deque(maxlen=max_stored_points)  # Last N recovery points
-        self.current_index = 0
-        self.timestamp = 0.0
         self.confidence_threshold = confidence_threshold
+        self.max_stored_points = max_stored_points
+        self.min_distance_m = min_distance_m
+        self.max_age_s = max_age_s
 
-    def process_model_output(self, model_output: Dict[str, torch.Tensor]) -> Optional[RecoveryPoint]:
-        """
-        Process model output to determine if this is a recovery point
-        
-        Args:
-            model_output: Dictionary containing model predictions
-                - 'path_status': Tensor of shape [batch_size, 3] with probabilities
-                - 'is_dead_end': Tensor of shape [batch_size, 1] with dead end probability
-        
-        Returns:
-            RecoveryPoint if this is a recovery point, None otherwise
-        """
-        # Get path status probabilities - handle batch dimension
-        path_status_tensor = torch.sigmoid(model_output['path_status']).cpu()
-        if path_status_tensor.dim() > 1:
-            path_probs = path_status_tensor[0].numpy()  # Take first batch element
-        else:
-            path_probs = path_status_tensor.numpy()
-        
-        # Convert probabilities to binary decisions using threshold
-        open_directions = (path_probs > self.confidence_threshold).astype(int)
-        
-        # Count number of open directions
-        num_open = int(np.sum(open_directions))  # Use np.sum to avoid ambiguity
-        
-        # If at least one direction is open, this is a recovery point
-        if num_open > 0:
-            point = RecoveryPoint(
-                index=self.current_index,
-                open_directions=open_directions.flatten().tolist(),
-                rank=num_open,
-                timestamp=self.timestamp,
-                confidence=path_probs.flatten().tolist()
-            )
-            
-            # Add to list of all recovery points
-            self.recovery_points.append(point)
-            
-            # Add to recent points queue
-            self.recent_points.append(point)
-            
-            return point
-        
-        return None
+        self.recovery_points: List[RecoveryPoint] = []
 
-    def is_dead_end(self, model_output: Dict[str, torch.Tensor]) -> bool:
-        """
-        Check if current position is a dead end based on model output
-        
-        Args:
-            model_output: Dictionary containing model predictions
-        
-        Returns:
-            True if all directions are closed (dead end), False otherwise
-        """
-        # Get path status probabilities - handle batch dimension
-        path_status_tensor = torch.sigmoid(model_output['path_status']).cpu()
-        if path_status_tensor.dim() > 1:
-            path_probs = path_status_tensor[0].numpy()  # Take first batch element
-        else:
-            path_probs = path_status_tensor.numpy()
-        
-        # Check if all directions are closed using numpy operations
-        return bool(np.all(path_probs <= self.confidence_threshold))
+    # ------------------------------------------------------------------
+    # Core detection
+    # ------------------------------------------------------------------
 
-    def get_recovery_points(self) -> Tuple[Optional[RecoveryPoint], Optional[RecoveryPoint]]:
+    def process_probabilities(self,
+                              path_probs: List[float],
+                              x: float,
+                              y: float) -> Optional[RecoveryPoint]:
         """
-        Get the last two recovery points
-        
-        Returns:
-            Tuple of (second_last_point, last_point)
-        """
-        if len(self.recent_points) == 0:
-            return None, None
-        elif len(self.recent_points) == 1:
-            return None, self.recent_points[-1]
-        else:
-            return self.recent_points[-2], self.recent_points[-1]
+        Main entry point for cost_layer_processor.
 
-    def get_best_recovery_point(self) -> Optional[RecoveryPoint]:
+        Takes already-computed path probabilities [front, left, right],
+        robot position in map frame, and decides whether this is a
+        recovery point worth storing.
+
+        If a nearby point already exists:
+          - keep the new one if it has a higher rank (more open directions)
+          - discard otherwise
+
+        Returns the new RecoveryPoint if stored, else None.
         """
-        Get the recovery point with highest rank (most open directions)
-        
-        Returns:
-            RecoveryPoint with highest rank, or None if no recovery points exist
-        """
+        probs = list(path_probs)[:3]
+        open_dirs = [1 if p > self.confidence_threshold else 0 for p in probs]
+        num_open = sum(open_dirs)
+
+        # A recovery point requires at least one open direction
+        if num_open == 0:
+            return None
+
+        # Expire stale points first
+        self._expire_old_points()
+
+        # Spatial deduplication — check for nearby existing point
+        nearby_idx = self._find_nearby_index(x, y)
+        if nearby_idx is not None:
+            existing = self.recovery_points[nearby_idx]
+            if num_open > existing.rank:
+                # Replace the existing point with the higher-rank one
+                point = RecoveryPoint(
+                    x=x, y=y,
+                    open_directions=open_dirs,
+                    rank=num_open,
+                    timestamp=time.time(),
+                    confidence=probs
+                )
+                self.recovery_points[nearby_idx] = point
+                return point
+            # Existing point is equal or better — discard new one
+            return None
+
+        point = RecoveryPoint(
+            x=x, y=y,
+            open_directions=open_dirs,
+            rank=num_open,
+            timestamp=time.time(),
+            confidence=probs
+        )
+
+        self.recovery_points.append(point)
+
+        # Enforce max capacity — drop oldest
+        if len(self.recovery_points) > self.max_stored_points:
+            self.recovery_points.pop(0)
+
+        return point
+
+    def is_dead_end(self, path_probs: List[float]) -> bool:
+        """True if all three directions are blocked (all below threshold)."""
+        return all(p <= self.confidence_threshold for p in list(path_probs)[:3])
+
+    # ------------------------------------------------------------------
+    # Retrieval  (all expire stale points before returning)
+    # ------------------------------------------------------------------
+
+    def get_last_recovery_point(self) -> Optional[RecoveryPoint]:
+        """Most recently stored recovery point."""
+        self._expire_old_points()
         if not self.recovery_points:
             return None
-        return max(self.recovery_points, key=lambda x: x.rank)
+        return self.recovery_points[-1]
 
-    def update(self, model_output: Dict[str, torch.Tensor], timestamp: float) -> Optional[RecoveryPoint]:
-        """
-        Update the manager with new model output
-        
-        Args:
-            model_output: Dictionary containing model predictions
-            timestamp: Current timestamp
-            
-        Returns:
-            RecoveryPoint if this is a recovery point, None otherwise
-        """
-        self.current_index += 1
-        self.timestamp = timestamp
-        return self.process_model_output(model_output)
+    def get_best_recovery_point(self) -> Optional[RecoveryPoint]:
+        """Recovery point with the most open directions (highest rank)."""
+        self._expire_old_points()
+        if not self.recovery_points:
+            return None
+        return max(self.recovery_points, key=lambda p: p.rank)
 
-    def get_recovery_strategy(self, model_output: Dict[str, torch.Tensor]) -> dict:
-        """
-        Get recovery strategy based on model output
-        
-        Args:
-            model_output: Dictionary containing model predictions
-        
-        Returns:
-            Dictionary containing recovery strategy information
-        """
-        if self.is_dead_end(model_output):
-            # Get last two recovery points
-            second_last, last = self.get_recovery_points()
-            
-            # Get best recovery point (highest rank)
-            best = self.get_best_recovery_point()
-            
-            # Get confidence scores for current position - handle batch dimension
-            path_status_tensor = torch.sigmoid(model_output['path_status']).cpu()
-            dead_end_tensor = torch.sigmoid(model_output['is_dead_end']).cpu()
-            
-            if path_status_tensor.dim() > 1:
-                path_probs = path_status_tensor[0].numpy()
-            else:
-                path_probs = path_status_tensor.numpy()
-                
-            if dead_end_tensor.dim() > 1:
-                dead_end_prob = dead_end_tensor[0].numpy()
-            else:
-                dead_end_prob = dead_end_tensor.numpy()
-            
-            return {
-                "is_dead_end": True,
-                "dead_end_confidence": float(dead_end_prob),
-                "path_confidences": path_probs.tolist(),
-                "recovery_points": {
-                    "second_last": second_last,
-                    "last": last,
-                    "best": best
-                },
-                "recommended_action": "Return to last recovery point" if last else "No recovery points available"
-            }
-        else:
-            return {
-                "is_dead_end": False,
-                "recovery_points": None,
-                "recommended_action": "Continue current path"
-            }
+    def get_nearest_recovery_point(self, robot_x: float, robot_y: float) -> Optional[RecoveryPoint]:
+        """Closest recovery point to the robot's current position."""
+        self._expire_old_points()
+        if not self.recovery_points:
+            return None
+        return min(self.recovery_points,
+                   key=lambda p: math.hypot(p.x - robot_x, p.y - robot_y))
 
-def process_batch_predictions(model_outputs: List[Dict[str, torch.Tensor]], timestamps: List[float]) -> List[dict]:
-    """
-    Process a batch of model predictions to identify recovery points and dead ends
-    
-    Args:
-        model_outputs: List of model output dictionaries
-        timestamps: List of timestamps corresponding to each prediction
-    
-    Returns:
-        List of recovery strategies for each prediction
-    """
-    manager = RecoveryPointManager()
-    strategies = []
-    
-    for output, timestamp in zip(model_outputs, timestamps):
-        # Update manager with current prediction
-        point = manager.update(output, timestamp)
-        
-        # Get recovery strategy
-        strategy = manager.get_recovery_strategy(output)
-        strategies.append(strategy)
-    
-    return strategies
+    def get_all_points(self) -> List[RecoveryPoint]:
+        """Return all valid (non-expired) recovery points."""
+        self._expire_old_points()
+        return list(self.recovery_points)
 
-# Example of how to use with model predictions
-if __name__ == "__main__":
-    # This would be replaced with actual model predictions
-    sample_output = {
-        'path_status': torch.tensor([[0.8, 0.2, 0.9]]),  # [front, left, right] probabilities
-        'is_dead_end': torch.tensor([[0.1]])  # Dead end probability
-    }
-    
-    manager = RecoveryPointManager()
-    point = manager.update(sample_output, timestamp=1.0)
-    
-    if point:
-        print(f"Recovery point found at index {point.index}:")
-        print(f"  Open directions: Front={point.open_directions[0]}, Left={point.open_directions[1]}, Right={point.open_directions[2]}")
-        print(f"  Rank: {point.rank}")
-        print(f"  Confidence scores: {point.confidence}")
-    
-    strategy = manager.get_recovery_strategy(sample_output)
-    print("\nRecovery strategy:")
-    print(f"  Is dead end: {strategy['is_dead_end']}")
-    print(f"  Recommended action: {strategy['recommended_action']}") 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _find_nearby_index(self, x: float, y: float) -> Optional[int]:
+        """Return index of the first existing point within min_distance_m, or None."""
+        for i, rp in enumerate(self.recovery_points):
+            if math.hypot(rp.x - x, rp.y - y) < self.min_distance_m:
+                return i
+        return None
+
+    def _expire_old_points(self):
+        cutoff = time.time() - self.max_age_s
+        self.recovery_points = [rp for rp in self.recovery_points
+                                if rp.timestamp >= cutoff]

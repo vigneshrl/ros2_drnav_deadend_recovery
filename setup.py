@@ -39,6 +39,7 @@ setup(
             'cost_layer_processor = map_contruct.scripts.utilities.cost_layer_processor:main',
             'odom_tf_broadcaster = map_contruct.scripts.utilities.odom_tf_brodcaster:main',
             'dram_heatmap_viz = map_contruct.scripts.utilities.dram_heatmap_viz:main',
+            'dram_risk_map = map_contruct.scripts.utilities.dram_risk_map:main',
             'slam = map_contruct.scripts.utilities.slam:main',
             
             # Scripts - Visualization
