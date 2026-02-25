@@ -34,6 +34,7 @@ scene_metrics/
 *.png
 *.jpg
 *.jpeg
+!images/**
 
 # IDE
 .vscode/
