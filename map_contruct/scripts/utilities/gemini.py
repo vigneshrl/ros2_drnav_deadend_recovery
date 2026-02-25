@@ -1,7 +1,7 @@
 # python bag_gemini_labeler.py --bag hallway_ros2/ --topic /camera/image --stride 3 --out labels.csv
 
-#api key - AIzaSyAqX1loin2TTl2BbYDW1fd88m3acLJ1IV8
-API_KEY = "AIzaSyAqX1loin2TTl2BbYDW1fd88m3acLJ1IV8"
+
+API_KEY = " "
 
 #!/usr/bin/env python3
 import os, sys, json, csv, signal
