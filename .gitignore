@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ROS2
+build/
+install/
+log/
+
+# Model weights (LARGE - DO NOT COMMIT)
+*.pth
+*.pkl
+*.h5
+*.ckpt
+model_wts/
+
+# Results and logs (LARGE - DO NOT COMMIT)
+results/
+*.bag
+*.mcap
+inference_results/
+scene_metrics/
+
+# Data files (keep configs, exclude data)
+*.csv
+*.json
+!package.xml
+!config/*.yaml
+
+# Images (LARGE - thousands of PNGs)
+*.png
+*.jpg
+*.jpeg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+*.tmp
+*.log

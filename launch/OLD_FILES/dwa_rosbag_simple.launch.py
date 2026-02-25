@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
+import os
+
+def generate_launch_description():
+    """
+    Simplified launch file for DWA planner with ROS2 bag data (without DRAM model)
+    """
+    
+    # Declare arguments
+    bag_path_arg = DeclareLaunchArgument(
+        'bag_path',
+        default_value='',
+        description='Path to the ROS2 bag file to replay'
+    )
+    
+    bag_rate_arg = DeclareLaunchArgument(
+        'bag_rate',
+        default_value='1.0',
+        description='Playback rate for the bag file (e.g., 0.5 for half speed)'
+    )
+
+    # Static transforms for coordinate frames
+    map_to_odom_publisher = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='map_to_odom_publisher',
+        arguments=['0', '0', '0', '0', '0', '0', 'map', 'odom'],
+        parameters=[{'use_sim_time': True}]
+    )
+    
+    odom_to_base_link_publisher = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='odom_to_base_link_publisher',
+        arguments=['0', '0', '0', '0', '0', '0', 'odom', 'base_link'],
+        parameters=[{'use_sim_time': True}]
+    )
+
+    # Dummy dead end detection (publishes false - no dead ends)
+    dummy_dead_end_node = Node(
+        package='map_contruct',
+        executable='dummy_dead_end_detector',
+        name='dummy_dead_end_detector',
+        output='screen',
+        parameters=[{
+            'use_sim_time': True
+        }]
+    )
+
+    # DWA Planner Node with Action Logging
+    dwa_planner_node = Node(
+        package='map_contruct',
+        executable='dwa_rosbag_planner',
+        name='dwa_rosbag_planner_node',
+        output='screen',
+        parameters=[{
+            'use_sim_time': True
+        }],
+        arguments=['--ros-args', '--log-level', 'info']
+    )
+
+    # SLAM Toolbox node for mapping
+    slam_toolbox_node = Node(
+        package='slam_toolbox',
+        executable='sync_slam_toolbox_node',
+        name='slam_toolbox',
+        output='screen',
+        parameters=[{
+            'resolution': 0.1,
+            'base_frame': 'base_link',
+            'odom_frame': 'odom',
+            'map_frame': 'map',
+            'use_sim_time': True,
+            'qos_overrides./map.publisher.durability': 'transient_local',
+            'qos_overrides./map.publisher.reliability': 'reliable',
+            'publish_period_sec': 0.1,
+            'publish_frame_transforms': True,
+            'map_update_interval': 2.0,
+            'queue_size': 1000,
+            'transform_publish_period': 0.05,
+            'tf_buffer_duration': 30.0,
+            'scan_queue_size': 1000,
+            'scan_buffer_duration': 10.0,
+            'scan_tolerance': 0.2,
+            'qos_overrides./scan.subscriber.reliability': 'best_effort',
+            'minimum_travel_distance': 0.1,
+            'minimum_travel_heading': 0.1,
+            'update_factor': 1.0,
+            'transform_timeout': 0.5,
+            'mode': 'localization'
+        }]
+    )
+
+    # Convert pointcloud to laserscan for SLAM
+    pointcloud_to_laserscan_node = Node(
+        package='pointcloud_to_laserscan',
+        executable='pointcloud_to_laserscan_node',
+        name='pointcloud_to_laserscan',
+        output='screen',
+        remappings=[
+            ('cloud_in', '/os_cloud_node/points'),
+            ('scan', '/scan')
+        ],
+        parameters=[{
+            'target_frame': '',
+            'transform_tolerance': 0.01,
+            'min_height': -0.5,
+            'max_height': 2.0,
+            'angle_min': -3.14159,
+            'angle_max': 3.14159,
+            'angle_increment': 0.0349,
+            'scan_time': 0.1,
+            'range_min': 0.3,
+            'range_max': 100.0,
+            'use_inf': True,
+            'use_sim_time': True
+        }]
+    )
+
+    # Goal Generator Node
+    goal_generator_node = Node(
+        package='map_contruct',
+        executable='simple_goal_generator',
+        name='simple_goal_generator',
+        output='screen',
+        parameters=[{
+            'use_sim_time': True,
+            'goal_distance': 10.0,
+            'goal_update_rate': 0.5
+        }]
+    )
+
+    # ROS Bag Play Node with delay
+    bag_play_node = TimerAction(
+        period=5.0,
+        actions=[
+            ExecuteProcess(
+                cmd=[
+                    'ros2', 'bag', 'play', 
+                    LaunchConfiguration('bag_path'),
+                    '--clock',
+                    '-r', LaunchConfiguration('bag_rate'),
+                    '--qos-profile-overrides-path', '/dev/null'
+                ],
+                output='screen'
+            )
+        ]
+    )
+
+    return LaunchDescription([
+        # Arguments
+        bag_path_arg,
+        bag_rate_arg,
+        
+        # Static transforms
+        map_to_odom_publisher,
+        odom_to_base_link_publisher,
+        
+        # Core nodes
+        dummy_dead_end_node,
+        dwa_planner_node,
+        
+        # SLAM and perception
+        pointcloud_to_laserscan_node,
+        slam_toolbox_node,
+        
+        # Goal generation
+        goal_generator_node,
+        
+        # Bag playback (delayed)
+        bag_play_node
+    ])
+
+
+

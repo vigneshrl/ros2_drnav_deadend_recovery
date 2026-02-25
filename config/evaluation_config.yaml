@@ -1,0 +1,61 @@
+# Enhanced Evaluation Framework Configuration
+
+# Global Map Configuration
+use_global_map: true
+global_map_file: "/home/mrvik/dram_ws/maps/your_environment_map.yaml"  # UPDATE THIS PATH
+
+# Goal Points (in map coordinates)
+goal_points:
+  - name: "Goal_A"
+    x: 10.0
+    y: 5.0
+    description: "First target location"
+  
+  - name: "Goal_B" 
+    x: -5.0
+    y: 10.0
+    description: "Second target location"
+    
+  - name: "Goal_C"
+    x: 15.0
+    y: -8.0
+    description: "Third target location"
+
+# Evaluation Parameters
+trial_duration: 300  # seconds (5 minutes per trial)
+num_trials: 10       # trials per method
+bootstrap_samples: 1000  # for confidence intervals
+
+# Robot Parameters (for simulation)
+robot_start_pose:
+  x: 0.0
+  y: 0.0
+  theta: 0.0
+
+# Success Criteria
+goal_tolerance: 2.0  # meters - how close to goal counts as success
+timeout_threshold: 290  # seconds - trial timeout before goal reached
+
+# Evaluation Methods
+methods:
+  multi_camera_dram:
+    enabled: true
+    description: "Your full method with 3 cameras and semantic cost layer"
+    
+  single_camera_dram:
+    enabled: true  
+    description: "Ablation study with single front camera"
+    
+  dwa_lidar:
+    enabled: true
+    description: "DWA baseline using only LiDAR data"
+    
+  mppi_lidar:
+    enabled: true
+    description: "MPPI baseline using only LiDAR data"
+
+# Output Configuration
+results_directory: "/home/mrvik/dram_ws/evaluation_results"
+generate_plots: true
+generate_paper_table: true
+save_raw_data: true
