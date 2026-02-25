@@ -545,7 +545,7 @@ Change to:
 model_path = '/your/path/to/model_best.pth'
 ```
 
-The model weights file (`model_best.pth`) must exist![here](https://drive.google.com/drive/folders/1WI5vdguuyMMoQxnnhyEcjAxYb8t-mCr_?usp=sharing). If the file is missing or the path is wrong, the node will log an error and no inference will be produced.
+The model weights file (`model_best.pth`) must exist [here](https://drive.google.com/drive/folders/1WI5vdguuyMMoQxnnhyEcjAxYb8t-mCr_?usp=sharing). If the file is missing or the path is wrong, the node will log an error and no inference will be produced.
 
 ---
 
