@@ -22,7 +22,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Point, Quaternion
 from nav_msgs.msg import OccupancyGrid
 from visualization_msgs.msg import MarkerArray, Marker
-from std_msgs.msg import Float32MultiArray, Bool, ColorRGBA
+from std_msgs.msg import Float32MultiArray, Bool, ColorRGBA, Float32
 from tf2_ros import TransformListener, Buffer
 import numpy as np
 import math
@@ -50,6 +50,7 @@ class GoalGenerator(Node):
         self.goal_pub = self.create_publisher(PoseStamped, '/move_base_simple/goal', 10)
         self.waypoint_viz_pub = self.create_publisher(MarkerArray, '/goal_generator/waypoints', 10)
         self.rays_viz_pub = self.create_publisher(MarkerArray, '/goal_generator/rays', 10)
+        self.ede_score_pub = self.create_publisher(Float32, '/ede_score', 10)
         
         # Subscribers (adapt based on method)
         if 'dram' in self.method_type:
@@ -397,23 +398,23 @@ class GoalGenerator(Node):
         
         return ede_score
 
-    def compute_unified_score(self, start_x: float, start_y: float, heading: float) -> Tuple[float, bool]:
+    def compute_unified_score(self, start_x: float, start_y: float, heading: float) -> Tuple[float, float, bool]:
         """
         Compute unified score: Score(θ) = J_geom(θ) + λ·EDE(θ)
-        
+
         Returns:
-            (total_score, is_feasible)
+            (total_score, ede, is_feasible)
         """
         # Compute geometric cost (same for all methods)
         j_geom, feasible = self.compute_j_geom(start_x, start_y, heading, self.horizon_distance)
-        
+
         # Compute EDE (only for DRaM methods when λ > 0)
         ede = self.compute_ede(start_x, start_y, heading, self.horizon_distance)
-        
+
         # Unified score
         total_score = j_geom + self.lambda_ede * ede
-        
-        return total_score, feasible
+
+        return total_score, ede, feasible
 
     def sample_exploration_waypoint(self) -> Optional[Tuple[float, float, float]]:
         """
@@ -427,40 +428,47 @@ class GoalGenerator(Node):
         self.last_robot_yaw = robot_yaw  # Update for smoothness cost
         
         best_score = float('inf')
+        best_ede = 0.0
         best_waypoint = None
         ray_scores = []  # For visualization
         feasible_rays = 0
-        
+
         # Sample headings θ ∈ [-π, π]
         for i in range(self.num_rays):
             heading = (2 * math.pi * i) / self.num_rays - math.pi  # [-π, π]
-            
+
             # Compute unified score: Score(θ) = J_geom(θ) + λ·EDE(θ)
-            score, feasible = self.compute_unified_score(robot_x, robot_y, heading)
+            score, ede, feasible = self.compute_unified_score(robot_x, robot_y, heading)
             ray_scores.append((heading, score, feasible))
-            
+
             if feasible:
                 feasible_rays += 1
-            
+
             # Track best direction (argmin θ*)
             if score < best_score:
                 best_score = score
+                best_ede = ede
                 best_heading = heading
-                
+
                 # Calculate waypoint position at range R
                 waypoint_x = robot_x + self.horizon_distance * math.cos(heading)
                 waypoint_y = robot_y + self.horizon_distance * math.sin(heading)
                 best_waypoint = (waypoint_x, waypoint_y, heading)
-        
+
         # Visualize rays
         self.visualize_rays(robot_x, robot_y, ray_scores)
-        
+
+        # Publish EDE score of the selected heading
+        ede_msg = Float32()
+        ede_msg.data = float(best_ede)
+        self.ede_score_pub.publish(ede_msg)
+
         # Check if "no good rays" (all blocked or risk too high)
         if best_score > self.score_threshold or feasible_rays == 0:
-            self.get_logger().warn(f'🚫 No good rays: best_score={best_score:.1f}, feasible={feasible_rays}/{self.num_rays}')
+            self.get_logger().warn(f'No good rays: best_score={best_score:.1f}, feasible={feasible_rays}/{self.num_rays}')
             return None
-        
-        self.get_logger().debug(f'✅ Best ray: θ={best_heading:.2f}rad, score={best_score:.1f}, feasible={feasible_rays}/{self.num_rays}')
+
+        self.get_logger().debug(f'Best ray: θ={best_heading:.2f}rad, score={best_score:.1f}, ede={best_ede:.3f}, feasible={feasible_rays}/{self.num_rays}')
         return best_waypoint
 
     def compute_recovery_score(self, candidate_x: float, candidate_y: float) -> float:
