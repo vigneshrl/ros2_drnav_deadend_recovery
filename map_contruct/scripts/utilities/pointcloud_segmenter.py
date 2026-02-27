@@ -4,6 +4,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2, PointField
+import sensor_msgs_py.point_cloud2 as pc2
 import numpy as np
 from std_msgs.msg import Header
 
@@ -32,27 +33,21 @@ class PointCloudSegmenter(Node):
     def pointcloud_callback(self, msg: PointCloud2):
         """Segment point cloud into front, left, right regions"""
         try:
-            # Parse field offsets from message header — works with any LiDAR format
-            field_offsets = {f.name: f.offset for f in msg.fields if f.name in ('x', 'y', 'z')}
-            if not all(k in field_offsets for k in ('x', 'y', 'z')):
-                self.get_logger().warn('PointCloud2 missing x/y/z fields')
+            # Convert PointCloud2 to numpy array
+            points_list = list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))
+            if not points_list:
                 return
 
-            n_pts = msg.width * msg.height
-            if n_pts == 0:
-                return
-
-            raw = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(n_pts, msg.point_step)
-            x = raw[:, field_offsets['x']:field_offsets['x'] + 4].copy().view(np.float32).flatten()
-            y = raw[:, field_offsets['y']:field_offsets['y'] + 4].copy().view(np.float32).flatten()
-            z = raw[:, field_offsets['z']:field_offsets['z'] + 4].copy().view(np.float32).flatten()
-            points = np.column_stack([x, y, z])
-
-            # Remove NaN/Inf points
-            valid = np.isfinite(points).all(axis=1)
-            points = points[valid]
-            if len(points) == 0:
-                return
+            # Handle both structured and regular arrays
+            if isinstance(points_list[0], (list, tuple)):
+                points = np.array(points_list, dtype=np.float32)
+            else:
+                structured_array = np.array(points_list)
+                points = np.column_stack([
+                    structured_array['x'],
+                    structured_array['y'],
+                    structured_array['z']
+                ]).astype(np.float32)
             
             # Calculate angles for each point
             angles = np.arctan2(points[:, 1], points[:, 0])  # atan2(y, x)

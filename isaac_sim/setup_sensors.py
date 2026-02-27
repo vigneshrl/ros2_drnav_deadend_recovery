@@ -92,19 +92,16 @@ lidar = LidarRtx(
     prim_path=LIDAR_PATH,
     name="lidar",
     translation=Gf.Vec3d(0.0, 0.0, 0.45),
-    config_file_name="OS1_128ch20hz1024res",
+    config_file_name="OS1_RV6_128ch20hz1024res",
 )
 lidar.initialize()
 
-# Get the render product path the sensor created internally.
-# If get_render_product_path() isn't available, fall back to creating one manually.
-try:
-    lidar_rp_path = lidar.get_render_product_path()
-    print(f"[DR.Nav] LiDAR render product (from sensor): {lidar_rp_path}")
-except AttributeError:
-    lidar_rp = rep.create.render_product(LIDAR_PATH, [1, 1])
-    lidar_rp_path = lidar_rp.path
-    print(f"[DR.Nav] LiDAR render product (created manually): {lidar_rp_path}")
+# Always create a fresh render product directly for the LiDAR prim.
+# DO NOT use get_render_product_path() — it returns the viewport camera's render
+# product (/Render/OmniverseKit/HydraTextures/...) not the LiDAR scan product.
+lidar_rp = rep.create.render_product(LIDAR_PATH, [1, 1])
+lidar_rp_path = lidar_rp.path
+print(f"[DR.Nav] LiDAR render product: {lidar_rp_path}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 5 — CAMERA RENDER PRODUCTS
