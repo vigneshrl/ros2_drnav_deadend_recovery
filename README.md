@@ -19,14 +19,19 @@
 5. [Hardware Requirements](#5-hardware-requirements)
 6. [Software Requirements](#6-software-requirements)
 7. [Installation](#7-installation)
+   - [Option A — Native Install](#option-a--native-install)
+   - [Option B — Docker (Recommended for deployment)](#option-b--docker-recommended-for-deployment)
 8. [Path Configuration — Required Before First Run](#8-path-configuration--required-before-first-run)
 9. [Running on a Real Robot](#9-running-on-a-real-robot)
    - [Mapless Mode](#91-mapless-mode)
    - [Map-Based Mode](#92-map-based-mode)
-10. [Launch File Arguments](#10-launch-file-arguments)
-11. [RViz Visualization Topics](#11-rviz-visualization-topics)
-12. [Key Parameters](#12-key-parameters)
-13. [Package Structure](#13-package-structure)
+10. [Running in Docker](#10-running-in-docker)
+11. [Isaac Sim Setup](#11-isaac-sim-setup)
+12. [Launch File Arguments](#12-launch-file-arguments)
+13. [RViz Visualization Topics](#13-rviz-visualization-topics)
+14. [Key Parameters](#14-key-parameters)
+15. [Package Structure](#15-package-structure)
+16. [Known Issues and Fixes](#16-known-issues-and-fixes)
 
 ---
 
@@ -172,8 +177,8 @@ Score(θ) = J_geom(θ) + λ · EDE(θ)
   ┌──────────────┐      │  Stack → image_tensors [3, 3, 224, 224]            │
   │  LiDAR       │      │                                                    │
   │  Callbacks   │      │  Point cloud: sample 1024 pts (robot_mode=True)    │
-  │  (3× PC2)    │─────▶│  Fields: x, y, z, intensity                        │
-  └──────────────┘      │  Stack → lidar_tensors [3, 1024, 4]                │
+  │  (3× PC2)    │─────▶│  Fields parsed from message header (any format)   │
+  └──────────────┘      │  Stack → lidar_tensors [3, 3, 1024]                │
                         └───────────────────┬────────────────────────────────┘
                                             │
                                             │  (batched every 1/5 s in robot_mode)
@@ -378,6 +383,9 @@ Runs the DRaM deep learning model (RGB + LiDAR fusion) and publishes per-directi
 | **Model output** | Sigmoid probabilities per direction — threshold 0.56 |
 | **Processing rate** | 5 Hz (robot mode), 10 Hz (rosbag mode) |
 | **Executor** | MultiThreadedExecutor, 4 threads |
+| **Point cloud parsing** | Pure numpy — reads field offsets from message header, works with any LiDAR format |
+| **Camera QoS** | RELIABLE (robot mode) — matches Isaac Sim and real camera drivers |
+| **LiDAR QoS** | BEST_EFFORT (robot mode) — matches real robot drivers and Isaac Sim |
 
 ---
 
@@ -483,133 +491,135 @@ CONTROL
 
 | Dependency | Version |
 |---|---|
-| ROS 2 | Humble or later |
-| Python | 3.8+ |
-| PyTorch | Compatible with installed CUDA version |
-| slam_toolbox | Any ROS 2 compatible version (mapless mode only) |
-| nav2_bringup | Any ROS 2 compatible version (map-based mode only) |
+| ROS 2 | Humble |
+| Python | 3.10 (system Python on Ubuntu 22.04) |
+| PyTorch | 2.0.1+cu118 (or compatible with your CUDA version) |
+| CUDA | 11.8 (Docker) or match your system |
 
 Python packages:
 
 ```bash
-pip install torch torchvision numpy opencv-python pillow matplotlib
+pip install torch torchvision numpy opencv-python pillow matplotlib scipy
 ```
 
 ROS 2 packages:
 
 ```
-sensor_msgs  tf2_ros  tf2_geometry_msgs  tf2_sensor_msgs  nav_msgs
-visualization_msgs  geometry_msgs  std_msgs  rclpy
+ros-humble-ros-base  ros-humble-sensor-msgs  ros-humble-sensor-msgs-py
+ros-humble-nav-msgs  ros-humble-geometry-msgs  ros-humble-visualization-msgs
+ros-humble-tf2-ros  ros-humble-tf2-geometry-msgs  ros-humble-tf2-sensor-msgs
+ros-humble-nav2-msgs
 ```
+
+> **Note:** `ros-humble-sensor-msgs-py` is a separate apt package and must be installed explicitly — it is not pulled in by `ros-humble-sensor-msgs`.
 
 ---
 
 ## 7. Installation
 
+### Option A — Native Install
+
 ```bash
 # Clone into your ROS 2 workspace source directory
 cd ~/ros2_ws/src
-git clone <repository-url> map_contruct_pkg
+git clone <repository-url> map_contruct
 
-# Install Python dependencies
-pip install torch torchvision numpy opencv-python pillow matplotlib
+# Install Python dependencies (use system Python, not conda)
+/usr/bin/python3 -m pip install torch==2.0.1+cu118 torchvision==0.15.2+cu118 \
+  --index-url https://download.pytorch.org/whl/cu118
+/usr/bin/python3 -m pip install numpy opencv-python pillow matplotlib scipy
+
+# Install ROS sensor_msgs_py
+sudo apt install ros-humble-sensor-msgs-py
 
 # Build the package
 cd ~/ros2_ws
-colcon build --packages-select map_contruct
+colcon build --symlink-install
 source install/setup.bash
+```
+
+> **Important:** Always use the system Python (`/usr/bin/python3`) for pip installs when running ROS 2 nodes. If you use a conda environment with a different Python version (e.g. 3.9 vs system 3.10), numpy C extensions will fail to load because they are compiled for a specific Python ABI.
+
+---
+
+### Option B — Docker (Recommended for deployment)
+
+No local Python or ROS installation needed. See [Section 10](#10-running-in-docker) for full Docker usage.
+
+```bash
+# Build the image (from repository root)
+docker build -t drnav .
+
+# Run with GPU, host networking, and model weights mounted
+docker run --rm -it --gpus all \
+  --network host --ipc host \
+  --name drnav_session \
+  -v /path/to/model_wts:/model_wts \
+  drnav bash
 ```
 
 ---
 
 ## 8. Path Configuration — Required Before First Run
 
-The following hardcoded paths must be updated to match your machine before the system will start correctly.
+### Model weights path
 
----
+The model weights path is configured as a ROS 2 parameter with the following priority:
 
-### Critical — System will fail to start without these
-
-**File:** `map_contruct/scripts/inference/infer_vis.py`
-
-**Line 69 — Model weights path:**
-
-```python
-# Change this to the full absolute path of your model_best.pth file
-model_path = '/home/mrvik/dram_ws/model_wts/model_best.pth'
+```
+ROS parameter  >  environment variable MODEL_PATH  >  default /model_wts/model_best.pth
 ```
 
-Change to:
+**Option 1 — Docker volume mount (recommended):**
 
-```python
-model_path = '/your/path/to/model_best.pth'
+```bash
+docker run ... -v /your/path/to/model_wts:/model_wts drnav bash
 ```
 
-The model weights file (`model_best.pth`) must exist [here](https://drive.google.com/drive/folders/1WI5vdguuyMMoQxnnhyEcjAxYb8t-mCr_?usp=sharing). If the file is missing or the path is wrong, the node will log an error and no inference will be produced.
+**Option 2 — ROS parameter override at runtime:**
+
+```bash
+ros2 run map_contruct infer_vis --ros-args -p model_path:=/your/path/model_best.pth
+```
+
+**Option 3 — Environment variable:**
+
+```bash
+export MODEL_PATH=/your/path/model_best.pth
+ros2 run map_contruct infer_vis
+```
+
+The model weights file (`model_best.pth`) is available [here](https://drive.google.com/drive/folders/1WI5vdguuyMMoQxnnhyEcjAxYb8t-mCr_?usp=sharing).
 
 ---
 
 ### Optional — Only required if `save_visualizations=True`
 
-**File:** `map_contruct/scripts/inference/infer_vis.py`
-
-**Line 42 — Inference output directory:**
+**File:** `map_contruct/scripts/inference/infer_vis.py`, line 42
 
 ```python
 self.output_dir = '/home/mrvik/dram_ws/inference_results'
 ```
 
-Change to any writable directory on your system:
-
-```python
-self.output_dir = '/your/path/to/output_directory'
-```
-
-This directory is used to save per-frame PNG images and a JSON metrics file. It is **only active** when the node is launched with `save_visualizations:=true`. In standard robot operation (`save_visualizations:=false`, which is the default in the launch files), this path is never accessed.
-
----
-
-### Optional — Only required if using `slam.py`
-
-**File:** `map_contruct/scripts/utilities/slam.py`
-
-**Line 21 — SLAM labels CSV path:**
-
-```python
-self.declare_parameter('csv_path',
-    '/home/mrvik/dram_ws/src/map_contruct/map_contruct/labels.csv')
-```
-
-This is a ROS 2 parameter with a default value. Override it at launch:
-
-```bash
-ros2 run map_contruct slam --ros-args -p csv_path:=/your/path/to/labels.csv
-```
+Change to any writable directory. This path is only accessed when launched with `save_visualizations:=true` (disabled by default in all launch files).
 
 ---
 
 ### Optional — Only required if using evaluation scripts
 
-The following files contain hardcoded paths used only during offline evaluation and post-processing. They are not part of the live robot pipeline.
-
 | File | Line | Path to change |
 |---|---|---|
-| `scripts/viz/evaluation_framework.py` | 79 | Results output: `/home/mrvik/dram_ws/evaluation_results/` |
-| `scripts/viz/evaluation_framework.py` | 185 | Metrics scan base dir: `/home/mrvik/dram_ws/evaluation_results` |
-| `scripts/viz/enhanced_evaluation_framework.py` | 49 | Global map file: `/path/to/your/global_map.yaml` |
-| `scripts/viz/enhanced_evaluation_framework.py` | 124 | Results output: `/home/mrvik/dram_ws/evaluation_results/` |
-| `scripts/viz/enhanced_evaluation_framework.py` | 235 | Metrics scan base dir: `/home/mrvik/dram_ws/evaluation_results` |
-| `scripts/viz/deadend_prediction_visualizer.py` | 25 | Figures output: `/home/mrvik/dram_ws/deadend_prediction_figures` |
-| `scripts/viz/comprehensive_deadend_visualizer.py` | 29 | Figures output: `/home/mrvik/dram_ws/comprehensive_figures` |
-| `scripts/viz/method_comparison_analyzer.py` | 35 | Base dir: `/home/mrvik/dram_ws` |
+| `scripts/viz/evaluation_framework.py` | 79 | Results output directory |
+| `scripts/viz/enhanced_evaluation_framework.py` | 49 | Global map file path |
+| `scripts/viz/deadend_prediction_visualizer.py` | 25 | Figures output directory |
+| `scripts/viz/comprehensive_deadend_visualizer.py` | 29 | Figures output directory |
+| `scripts/viz/method_comparison_analyzer.py` | 35 | Base directory |
 
 ---
 
 ## 9. Running on a Real Robot
 
 ### TF Frame Requirements
-
-The system requires the following TF tree to be present:
 
 ```
 map ──▶ odom ──▶ body
@@ -618,13 +628,11 @@ map ──▶ odom ──▶ body
 - `map → odom`: Provided by SLAM (slam_toolbox) or AMCL (nav2_bringup)
 - `odom → body`: Provided by `odom_tf_broadcaster` (included in all launch files)
 
-Ensure your hardware drivers publish `/odom_lidar` (nav_msgs/Odometry) and that the LiDAR and camera drivers are running before launching.
+Ensure your hardware drivers publish `/odom_lidar` (nav_msgs/Odometry) before launching.
 
 ---
 
 ### 9.1 Mapless Mode
-
-Use this mode for exploration in an unknown environment. SLAM builds the map on the fly.
 
 **Terminal 1 — SLAM:**
 
@@ -639,13 +647,7 @@ source ~/ros2_ws/install/setup.bash
 ros2 launch map_contruct mapless.launch.py method:=dram
 ```
 
-To open RViz alongside:
-
-```bash
-ros2 launch map_contruct mapless.launch.py method:=dram use_rviz:=true
-```
-
-Nodes started by this command:
+Nodes started:
 
 ```
 odom_tf_broadcaster
@@ -660,9 +662,7 @@ dwa_planner
 
 ### 9.2 Map-Based Mode
 
-Use this mode when a pre-built map is available. Nav2 handles localization and global planning. DR.Nav adds the dead-end perception stack on top.
-
-**Terminal 1 — Nav2 with your map:**
+**Terminal 1 — Nav2:**
 
 ```bash
 ros2 launch nav2_bringup bringup_launch.py \
@@ -677,19 +677,133 @@ source ~/ros2_ws/install/setup.bash
 ros2 launch map_contruct map_based.launch.py method:=dram
 ```
 
-Nodes started by this command:
-
-```
-pointcloud_segmenter
-infer_vis            (robot_mode=true, save_visualizations=false)
-dram_risk_map
-```
-
-In map-based mode, `goal_generator` and `dwa_planner` are **not** launched. Navigation goals are sent via the RViz "Nav2 Goal" button, which feeds directly into Nav2's `bt_navigator` → `planner_server` → `controller_server` pipeline.
+In map-based mode, `goal_generator` and `dwa_planner` are **not** launched — navigation goals come from the RViz Nav2 Goal button into Nav2's BT Navigator.
 
 ---
 
-## 10. Launch File Arguments
+## 10. Running in Docker
+
+The Docker image bundles ROS 2 Humble, PyTorch (CUDA 11.8), and all Python dependencies. No local install needed.
+
+### Build
+
+```bash
+docker build -t drnav .
+```
+
+### Start a session
+
+```bash
+docker run --rm -it --gpus all \
+  --network host --ipc host \
+  --name drnav_session \
+  -v /path/to/model_wts:/model_wts \
+  drnav bash
+```
+
+Inside the container, source the workspace:
+
+```bash
+source /opt/ros/humble/setup.bash
+source /ros2_ws/install/setup.bash
+```
+
+### Open additional terminals into the same container
+
+```bash
+docker exec -it drnav_session bash
+```
+
+`--network host` and `--ipc host` are container-level settings — all `exec` sessions inherit them automatically. No need to repeat these flags.
+
+### Required flags explained
+
+| Flag | Why it is required |
+|---|---|
+| `--network host` | Shares the host network stack so ROS 2 DDS discovery works between container and Isaac Sim / robot |
+| `--ipc host` | Shares host IPC namespace so FastDDS shared-memory transport works — without this, topics are visible but carry no data |
+| `--gpus all` | Exposes NVIDIA GPU for PyTorch CUDA inference |
+
+### Host kernel tuning (required when running pointcloud_segmenter alongside cameras)
+
+Large PointCloud2 messages can overflow the default UDP socket receive buffer, silently dropping camera image packets. Set this on the **host** before starting Docker:
+
+```bash
+sudo sysctl -w net.core.rmem_max=67108864
+sudo sysctl -w net.core.rmem_default=67108864
+sudo sysctl -w net.core.wmem_max=67108864
+```
+
+To make permanent:
+
+```bash
+echo "net.core.rmem_max=67108864" | sudo tee -a /etc/sysctl.conf
+echo "net.core.rmem_default=67108864" | sudo tee -a /etc/sysctl.conf
+echo "net.core.wmem_max=67108864" | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+```
+
+> **Note:** These sysctls cannot be set via `--sysctl` in `docker run` when using `--network host` because the container shares the host network namespace.
+
+---
+
+## 11. Isaac Sim Setup
+
+Scripts for setting up sensors and teleop in Isaac Sim 4.5 are in the `isaac_sim/` directory. Run them from **Window → Script Editor** inside Isaac Sim.
+
+### Prerequisites
+
+- USD file open with `/World/Spot` robot prim
+- `isaacsim.ros2.bridge` extension enabled (Window → Extensions → search ROS2)
+- Simulation not yet playing
+
+### Scripts
+
+| Script | Purpose |
+|---|---|
+| `isaac_sim/setup_sensors.py` | Creates cameras, LiDAR, odometry OmniGraph and starts simulation |
+| `isaac_sim/setup_teleop.py` | Enables keyboard teleop via `/cmd_vel` using kinematic transform control |
+| `isaac_sim/cleanup.py` | Removes all sensor prims and graphs — run before saving USD |
+| `isaac_sim/discover_attrs.py` | Prints all inputs/outputs of OmniGraph nodes — useful for debugging attribute names |
+
+### Topics published by `setup_sensors.py`
+
+| Topic | Rate | Type |
+|---|---|---|
+| `/argus/ar0234_front_left/image_raw` | 10 Hz | sensor_msgs/Image |
+| `/argus/ar0234_side_left/image_raw` | 10 Hz | sensor_msgs/Image |
+| `/argus/ar0234_side_right/image_raw` | 10 Hz | sensor_msgs/Image |
+| `/os_cloud_node/points` | 20 Hz | sensor_msgs/PointCloud2 |
+| `/odom_lidar` | 60 Hz | nav_msgs/Odometry |
+
+### Isaac Sim 4.5 node namespace changes
+
+All OmniGraph node types changed in Isaac Sim 4.5. Old names cause "unrecognized type" errors:
+
+| Old (pre-4.5) | New (4.5+) |
+|---|---|
+| `omni.isaac.core_nodes.*` | `isaacsim.core.nodes.*` |
+| `omni.isaac.ros2_bridge.*` | `isaacsim.ros2.bridge.*` |
+
+### Important attribute changes in 4.5
+
+| Node | Old attribute | New attribute |
+|---|---|---|
+| `ROS2RtxLidarHelper` | `inputs:lidarPrimPath` | `inputs:renderProductPath` |
+| `ROS2PublishOdometry` | `inputs:odomTopicName` | `inputs:topicName` |
+| `IsaacComputeOdometry` | `inputs:chassisPrimPath` | *(removed — auto-detects robot)* |
+| `IsaacReadSimulationTime` | `inputs:execIn` | *(removed — pure data node, no tick wiring)* |
+
+### Render products and USD saving
+
+Render products (camera/LiDAR GPU buffers) are runtime objects and cannot be saved to USD. When you reopen a saved USD, render product errors will appear. The correct workflow is:
+
+1. Run `cleanup.py` before saving the USD
+2. Re-run `setup_sensors.py` at the start of each Isaac Sim session
+
+---
+
+## 12. Launch File Arguments
 
 ### `mapless.launch.py`
 
@@ -701,8 +815,6 @@ ros2 launch map_contruct mapless.launch.py method:=<method> [use_rviz:=true]
 |---|---|---|---|
 | `method` | `dram`, `dwa`, `mppi`, `nav2_dwb` | `dwa` | Navigation method to run |
 | `use_rviz` | `true`, `false` | `false` | Launch RViz for visualization |
-
-Method behaviour:
 
 | Method | Nodes launched | `lambda_ede` |
 |---|---|---|
@@ -719,25 +831,16 @@ Method behaviour:
 ros2 launch map_contruct map_based.launch.py method:=<method> [use_rviz:=true]
 ```
 
-| Argument | Options | Default | Description |
-|---|---|---|---|
-| `method` | `dram`, `dwa`, `mppi`, `nav2_dwb` | `dram` | Navigation method |
-| `use_rviz` | `true`, `false` | `false` | Launch RViz |
-
-Method behaviour:
-
 | Method | Additional nodes launched | Notes |
 |---|---|---|
 | `dram` | pointcloud_segmenter + infer_vis + dram_risk_map | Nav2 drives; DR.Nav provides risk perception |
-| `dwa` | None | Handled entirely by nav2_bringup (use nav2_params_dwa.yaml) |
-| `mppi` | None | Handled entirely by nav2_bringup (use nav2_params_mppi.yaml) |
-| `nav2_dwb` | None | Handled entirely by nav2_bringup (default nav2_params.yaml) |
+| `dwa` | None | Handled entirely by nav2_bringup |
+| `mppi` | None | Handled entirely by nav2_bringup |
+| `nav2_dwb` | None | Handled entirely by nav2_bringup |
 
 ---
 
-## 11. RViz Visualization Topics
-
-Add these topics to an RViz configuration to monitor the system:
+## 13. RViz Visualization Topics
 
 | Topic | Type | What it shows |
 |---|---|---|
@@ -747,15 +850,14 @@ Add these topics to an RViz configuration to monitor the system:
 | `/goal_generator/rays` | MarkerArray | All 36 scored heading rays |
 | `/map` | OccupancyGrid | Occupancy grid (from SLAM or Nav2) |
 
-Recovery points and direction status spheres are included within `/dram_exploration_map` (namespaces: `recovery_pins`, `recovery_labels`, `status_center`).
-
 ---
 
-## 12. Key Parameters
+## 14. Key Parameters
 
 | Parameter | Node | Default | Description |
 |---|---|---|---|
-| `robot_mode` | `infer_vis` | `true` | Use BEST_EFFORT QoS, 1024 pts/cloud, 5 Hz inference |
+| `model_path` | `infer_vis` | `$MODEL_PATH` env var or `/model_wts/model_best.pth` | Path to model weights file |
+| `robot_mode` | `infer_vis` | `true` | RELIABLE QoS for cameras, BEST_EFFORT for LiDAR, 1024 pts/cloud, 5 Hz |
 | `save_visualizations` | `infer_vis` | `false` | Save per-frame PNGs and JSON metrics to disk |
 | `method_type` | `goal_generator` | `multi_camera_dram` | Selects EDE scoring and recovery logic |
 | `lambda_ede` | `goal_generator` | `1.0` | EDE weight in unified scoring (0 = baseline) |
@@ -767,16 +869,16 @@ Recovery points and direction status spheres are included within `/dram_explorat
 
 ---
 
-## 13. Package Structure
+## 15. Package Structure
 
 ```
 ros2_drnav_deadend_recovery/
 ├── map_contruct/
 │   ├── scripts/
 │   │   ├── inference/
-│   │   │   └── infer_vis.py          # DRaM model inference node
+│   │   │   └── infer_vis.py              # DRaM model inference node
 │   │   ├── models/
-│   │   │   └── model_CA.py           # DeadEndDetectionModel architecture
+│   │   │   └── model_CA.py               # DeadEndDetectionModel architecture
 │   │   └── utilities/
 │   │       ├── pointcloud_segmenter.py   # LiDAR sector splitter
 │   │       ├── odom_tf_brodcaster.py     # Odometry → TF broadcaster
@@ -794,8 +896,140 @@ ros2_drnav_deadend_recovery/
 ├── launch/
 │   ├── mapless.launch.py                 # Mapless mode: all methods
 │   └── map_based.launch.py               # Map-based mode: all methods
-├── config/
-│   └── evaluation_config.yaml            # Evaluation trial parameters
+├── isaac_sim/
+│   ├── setup_sensors.py                  # Isaac Sim 4.5 sensor OmniGraph setup
+│   ├── setup_teleop.py                   # Kinematic teleop via /cmd_vel
+│   ├── cleanup.py                        # Wipe graphs/sensors before saving USD
+│   └── discover_attrs.py                 # Print OmniGraph node attributes
+├── Dockerfile                            # Container with ROS 2 Humble + PyTorch
+├── .dockerignore
 ├── setup.py
 └── package.xml
 ```
+
+---
+
+## 16. Known Issues and Fixes
+
+### Python and Package Issues
+
+---
+
+**`ModuleNotFoundError: No module named 'map_contruct.scripts'`**
+
+`setup.py` had `packages=[package_name]` which only installs the top-level package. Subpackages like `scripts`, `models`, and `goal_generator` were invisible to the ROS entry points.
+
+Fix: changed to `packages=find_packages()` in `setup.py`. Requires a rebuild:
+
+```bash
+colcon build --symlink-install
+source install/setup.bash
+```
+
+---
+
+**`ModuleNotFoundError: No module named 'torch'` or `torchvision not found` on a machine with conda**
+
+ROS 2 entry points always use the system Python (`/usr/bin/python3`). If torch was installed into a conda environment with a different Python version (e.g. 3.9 while system is 3.10), the packages are invisible to ROS nodes. Numpy C extensions compiled for Python 3.9 also fail to load in Python 3.10.
+
+Fix: install directly into the system Python:
+
+```bash
+/usr/bin/python3 -m pip install torch==2.0.1+cu118 torchvision==0.15.2+cu118 \
+  --index-url https://download.pytorch.org/whl/cu118
+/usr/bin/python3 -m pip install numpy opencv-python pillow matplotlib scipy
+```
+
+---
+
+**`infer_vis` error: "Numpy is not available" from point cloud conversion**
+
+The original `ros_pointcloud_to_numpy` used a fixed dtype `(x, y, z, intensity)` assuming 16 bytes per point. The OS1-128 LiDAR has additional fields (ring, timestamp, reflectivity, etc.) making the actual `point_step` much larger. The direct buffer read failed silently, fell back to `sensor_msgs_py.point_cloud2.read_points()`, and that raised the error.
+
+Fix: replaced the entire function with a pure-numpy implementation that reads field byte-offsets directly from the PointCloud2 message header. Works with any LiDAR format regardless of `point_step`.
+
+---
+
+### Docker Issues
+
+---
+
+**Topics visible inside container but no data arriving (`ros2 topic hz` shows 0)**
+
+FastDDS uses shared-memory (SHM) transport by default when publisher and subscriber are on the same machine. The Docker container cannot access host SHM without explicit IPC namespace sharing.
+
+Fix: add `--ipc host` to `docker run`.
+
+---
+
+**Camera topics show 0 Hz when `pointcloud_segmenter` is running, but work when it is stopped**
+
+Large PointCloud2 messages from the LiDAR flood the kernel UDP socket receive buffer, causing camera image packets to be dropped. The OS default buffer (212 KB) is too small for simultaneous multi-sensor traffic.
+
+Fix: increase the UDP receive buffer on the **host** (not inside Docker — this cannot be set via `--sysctl` when using `--network host`):
+
+```bash
+sudo sysctl -w net.core.rmem_max=67108864
+sudo sysctl -w net.core.rmem_default=67108864
+sudo sysctl -w net.core.wmem_max=67108864
+```
+
+---
+
+**`docker run --sysctl net.core.rmem_default=... ` fails: "sysctl not allowed in host network namespace"**
+
+When `--network host` is used, the container shares the host's network namespace. Network-related sysctls can only be set on the host itself, not through `docker run --sysctl`.
+
+Fix: set the sysctls on the host directly (see above).
+
+---
+
+**Camera subscriptions receiving no messages despite topics being published (cameras show `False` in diagnostic)**
+
+Isaac Sim's `ROS2CameraHelper` publishes camera images with `RELIABLE` QoS. The original `infer_vis.py` used `BEST_EFFORT` for all subscriptions in robot mode, causing a QoS mismatch for cameras.
+
+Fix: separated QoS profiles — cameras use `RELIABLE`, LiDAR uses `BEST_EFFORT`. This matches both Isaac Sim and real robot camera drivers.
+
+---
+
+### Isaac Sim Issues
+
+---
+
+**`OmniGraph error: unrecognized type omni.isaac.core_nodes.IsaacReadSimulationTime`**
+
+Isaac Sim 4.5 renamed all node types. The `omni.isaac.*` namespace no longer exists.
+
+Fix: update all node type strings — `omni.isaac.core_nodes.*` → `isaacsim.core.nodes.*`, `omni.isaac.ros2_bridge.*` → `isaacsim.ros2.bridge.*`. Also enable extensions **before** creating the graph, not after.
+
+---
+
+**`failed to connect /World/DRNav_Graph/ontick to simtime/inputs:execIn`**
+
+`IsaacReadSimulationTime` is a pure data node in Isaac Sim 4.5 — it has no `execIn` port. Wiring the tick to it causes a connection error.
+
+Fix: do not wire the tick to `simtime`. Connect its `outputs:simulationTime` directly to `odompub.inputs:timeStamp` as a data connection only.
+
+---
+
+**`failed trying to look up attribute inputs:lidarPrimPath`**
+
+`ROS2RtxLidarHelper` removed `inputs:lidarPrimPath` in Isaac Sim 4.5. The LiDAR sensor now works through a render product.
+
+Fix: call `lidar.get_render_product_path()` after initializing the `LidarRtx` sensor and pass that to `inputs:renderProductPath`.
+
+---
+
+**`Assertion raised in compute — Invalid renderProduct` when reopening a saved USD**
+
+Render products (camera and LiDAR GPU buffers) are runtime-only objects. They cannot be serialized to USD and become invalid when the file is closed and reopened.
+
+Fix: run `cleanup.py` from the Script Editor before saving the USD. Re-run `setup_sensors.py` at the start of every Isaac Sim session.
+
+---
+
+**`AttributeError: 'NoneType' object has no attribute '_physx_interface'`**
+
+`get_physx_interface()` returns `None` in Isaac Sim 4.5. `RigidPrim.initialize()` also calls it internally, so setting velocities via the physics API fails.
+
+Fix: use kinematic transform control instead. Set `UsdPhysics.RigidBodyAPI.CreateKinematicEnabledAttr(True)` on the robot prim and update the USD Xform transform directly via `omni.kit.app.get_update_event_stream()` each frame.

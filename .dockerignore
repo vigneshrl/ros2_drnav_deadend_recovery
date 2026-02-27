@@ -1,0 +1,16 @@
+.git
+dump/
+isaac_sim/
+model_wts/
+*.pth
+*.pt
+*.bag
+*.png
+*.jpg
+*.jpeg
+__pycache__/
+*.pyc
+build/
+install/
+log/
+.DS_Store

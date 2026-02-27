@@ -65,8 +65,9 @@ class DeadEndDetectionNodeWithVisualization(Node):
         self.model = DeadEndDetectionModel()
         
         # Load model weights
-        # model_path = '/media/mrvik/ROGZ/Ubuntu_files/DRaM/RAL2025/saved_models_latest/model_best.pth'
-        model_path ='/home/mrvik/dram_ws/model_wts/model_best.pth'
+        # Priority: ROS param > env var > default container path
+        _default = os.environ.get('MODEL_PATH', '/model_wts/model_best.pth')
+        model_path = self.declare_parameter('model_path', _default).get_parameter_value().string_value
         try:
             checkpoint = torch.load(model_path, map_location=self.device)
             self.model.load_state_dict(checkpoint, strict=False)
@@ -106,32 +107,35 @@ class DeadEndDetectionNodeWithVisualization(Node):
         self.callback_count = 0
         self.last_callback_time = time.time()
         
-        # Initialize subscribers with optimal QoS for robot mode
+        # Initialize subscribers with optimal QoS for each sensor type
         if self.robot_mode:
-            # ROBOT MODE: Aggressive QoS to prevent blocking
-            qos_profile = QoSProfile(
-                depth=1,  # Keep only latest message
-                reliability=ReliabilityPolicy.BEST_EFFORT  # Don't wait for acknowledgments
-            )
-        else:
-            # ROSBAG MODE: Standard QoS
-            qos_profile = QoSProfile(
-                depth=10,
+            # Cameras: RELIABLE — matches Isaac Sim ROS2CameraHelper and real camera drivers
+            cam_qos = QoSProfile(
+                depth=1,
                 reliability=ReliabilityPolicy.RELIABLE
             )
+            # LiDAR: BEST_EFFORT — matches real robot drivers and Isaac Sim lidar
+            lidar_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.BEST_EFFORT
+            )
+        else:
+            # ROSBAG MODE: RELIABLE for all
+            cam_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+            lidar_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
         self.front_cam_sub = self.create_subscription(
-            Image, '/argus/ar0234_front_left/image_raw', self.front_cam_callback, qos_profile)
+            Image, '/argus/ar0234_front_left/image_raw', self.front_cam_callback, cam_qos)
         self.left_cam_sub = self.create_subscription(
-            Image, '/argus/ar0234_side_left/image_raw', self.left_cam_callback, qos_profile)
+            Image, '/argus/ar0234_side_left/image_raw', self.left_cam_callback, cam_qos)
         self.right_cam_sub = self.create_subscription(
-            Image, '/argus/ar0234_side_right/image_raw', self.right_cam_callback, qos_profile)
+            Image, '/argus/ar0234_side_right/image_raw', self.right_cam_callback, cam_qos)
         self.front_lidar_sub = self.create_subscription(
-            PointCloud2, '/lidar/front/points', self.front_lidar_callback, qos_profile)
+            PointCloud2, '/lidar/front/points', self.front_lidar_callback, lidar_qos)
         self.left_lidar_sub = self.create_subscription(
-            PointCloud2, '/lidar/left/points', self.left_lidar_callback, qos_profile)
+            PointCloud2, '/lidar/left/points', self.left_lidar_callback, lidar_qos)
         self.right_lidar_sub = self.create_subscription(
-            PointCloud2, '/lidar/right/points', self.right_lidar_callback, qos_profile)
+            PointCloud2, '/lidar/right/points', self.right_lidar_callback, lidar_qos)
         
         # Initialize publishers
         self.dead_end_pub = self.create_publisher(Bool, '/dead_end_detection/is_dead_end', 10)
@@ -222,105 +226,51 @@ class DeadEndDetectionNodeWithVisualization(Node):
         return PILImage.fromarray(cv_image)
 
     def ros_pointcloud_to_numpy(self, msg: PointCloud2) -> np.ndarray:
-        """Convert ROS PointCloud2 message to numpy array - OPTIMIZED for robot mode"""
-        import sensor_msgs_py.point_cloud2 as pc2
-        
+        """Convert ROS PointCloud2 message to numpy array using pure numpy.
+        Reads field offsets directly from the message header so it works with
+        any point cloud format (OS1, VLP-16, Isaac Sim, etc.)."""
+        num_points = 1024 if self.robot_mode else 4096
+
         try:
-            # OPTIMIZATION: For robot mode, use MUCH faster processing
-            if self.robot_mode:
-                # AGGRESSIVE OPTIMIZATION: Use much fewer points for robot mode
-                num_points = 1024  # Reduce from 4096 to 1024 for robot mode
-                
-                # Use numpy array operations directly on message data (fastest method)
-                try:
-                    # Extract point data directly from message buffer
-                    dtype = np.dtype([
-                        ('x', np.float32),
-                        ('y', np.float32), 
-                        ('z', np.float32),
-                        ('intensity', np.float32)  # Skip this field
-                    ])
-                    
-                    # Read raw data and reshape
-                    point_data = np.frombuffer(msg.data, dtype=dtype)
-                    
-                    if len(point_data) == 0:
-                        return np.zeros((3, num_points), dtype=np.float32)
-                    
-                    # Extract x, y, z coordinates
-                    xyz = np.column_stack([point_data['x'], point_data['y'], point_data['z']])
-                    
-                    # Filter out invalid points (much faster than skip_nans)
-                    valid_mask = np.isfinite(xyz).all(axis=1)
-                    xyz = xyz[valid_mask]
-                    
-                    if len(xyz) == 0:
-                        return np.zeros((3, num_points), dtype=np.float32)
-                    
-                    # Fast downsampling - take every Nth point
-                    if len(xyz) > num_points:
-                        step = max(1, len(xyz) // num_points)
-                        xyz = xyz[::step][:num_points]
-                    
-                    # Pad to exact size if needed
-                    if len(xyz) < num_points:
-                        padding = np.tile(xyz[-1:], (num_points - len(xyz), 1))
-                        xyz = np.vstack([xyz, padding])
-                    
-                    return xyz[:num_points].T.astype(np.float32)
-                    
-                except Exception:
-                    # Fallback to slower method if direct buffer reading fails
-                    points_gen = pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
-                    
-                    points_list = []
-                    for i, point in enumerate(points_gen):
-                        if i % 4 == 0:  # Take every 4th point for speed
-                            points_list.append([point[0], point[1], point[2]])
-                            if len(points_list) >= num_points:
-                                break
-                    
-                    if not points_list:
-                        return np.zeros((3, num_points), dtype=np.float32)
-                    
-                    points = np.array(points_list, dtype=np.float32)
-                    
-                    # Simple padding
-                    if points.shape[0] < num_points:
-                        points = np.pad(points, ((0, num_points - points.shape[0]), (0, 0)), mode='edge')
-                    
-                    return points[:num_points, :].T
-            
-            else:
-                # Original method for rosbag processing
-                points_list = list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))
-                
-                if not points_list:
-                    return np.zeros((3, 1), dtype=np.float32)
-                
-                # Handle both structured and unstructured arrays
-                if isinstance(points_list[0], (list, tuple)):
-                    points = np.array(points_list, dtype=np.float32)
-                else:
-                    structured_array = np.array(points_list)
-                    points = np.column_stack([
-                        structured_array['x'], structured_array['y'], structured_array['z']
-                    ]).astype(np.float32)
-                
-                # Sample/pad to exactly 4096 points (same as training)
-                num_points = 4096
-                if points.shape[0] > num_points:
-                    indices = np.random.choice(points.shape[0], num_points, replace=False)
-                    points = points[indices, :]
-                elif points.shape[0] < num_points:
-                    repeat_times = (num_points + points.shape[0] - 1) // points.shape[0]
-                    points = np.tile(points, (repeat_times, 1))[:num_points, :]
-                
-                return points.T  # Shape: (3, N) for PointNet
-            
+            # Parse x/y/z field byte-offsets from message header
+            field_offsets = {f.name: f.offset for f in msg.fields if f.name in ('x', 'y', 'z')}
+            if not all(k in field_offsets for k in ('x', 'y', 'z')):
+                self.get_logger().warn('⚠️  PointCloud2 missing x/y/z fields')
+                return np.zeros((3, num_points), dtype=np.float32)
+
+            n_pts = msg.width * msg.height
+            if n_pts == 0:
+                return np.zeros((3, num_points), dtype=np.float32)
+
+            # Reshape raw bytes to (n_pts, point_step) — works for any point_step
+            raw = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(n_pts, msg.point_step)
+
+            # Extract each coordinate as float32 from its byte offset
+            x = raw[:, field_offsets['x']:field_offsets['x'] + 4].copy().view(np.float32).flatten()
+            y = raw[:, field_offsets['y']:field_offsets['y'] + 4].copy().view(np.float32).flatten()
+            z = raw[:, field_offsets['z']:field_offsets['z'] + 4].copy().view(np.float32).flatten()
+            xyz = np.column_stack([x, y, z])
+
+            # Remove NaN/Inf points
+            valid = np.isfinite(xyz).all(axis=1)
+            xyz = xyz[valid]
+
+            if len(xyz) == 0:
+                return np.zeros((3, num_points), dtype=np.float32)
+
+            # Downsample / pad to target size
+            if len(xyz) > num_points:
+                step = max(1, len(xyz) // num_points)
+                xyz = xyz[::step][:num_points]
+            if len(xyz) < num_points:
+                padding = np.tile(xyz[-1:], (num_points - len(xyz), 1))
+                xyz = np.vstack([xyz, padding])
+
+            return xyz[:num_points].T.astype(np.float32)  # (3, N)
+
         except Exception as e:
             self.get_logger().error(f'❌ Error in point cloud conversion: {e}')
-            return np.zeros((3, 1), dtype=np.float32)
+            return np.zeros((3, num_points), dtype=np.float32)
 
     def plot_direction_vectors(self, ax, img, direction_vectors, path_probs, view_type='front', scale=50):
         """Plot direction vectors as arrows on the image - same as data_loader.py"""
