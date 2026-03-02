@@ -35,7 +35,7 @@ class DeadEndDetectionNodeWithVisualization(Node):
         
         # ADD: Robot mode flag to disable heavy processing
         self.robot_mode = self.declare_parameter('robot_mode', True).get_parameter_value().bool_value
-        self.save_visualizations = self.declare_parameter('save_visualizations', True).get_parameter_value().bool_value
+        self.save_visualizations = self.declare_parameter('save_visualizations', False).get_parameter_value().bool_value
         
         # Visualization and saving setup (only if needed)
         if self.save_visualizations:
@@ -151,8 +151,8 @@ class DeadEndDetectionNodeWithVisualization(Node):
         
         # Initialize synchronization - adjust for robot mode
         self.last_processed_time = 0
-        self.processing_interval = 0.5 if self.robot_mode else 0.2  # Slower processing for robot mode
-        
+        _deafult_interval = 0.1 if self.robot_mode else 0.2  # Slower processing for robot mode
+        self.processing_interval = 0.1 if self.robot_mode else 0.2
         self.get_logger().info('🚀 Dead End Detection Node with Visualization initialized')
         if hasattr(self, 'output_dir'):
             self.get_logger().info(f'📁 Output directory: {self.output_dir}')

@@ -83,7 +83,7 @@ class MppiPlannerNode(Node):
     def get_robot_pose(self):
         try:
             transform = self.tf_buffer.lookup_transform(
-                'map', 'odom', rclpy.time.Time(),
+                'map', 'base_link', rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.1)
             )
             x = transform.transform.translation.x
@@ -153,8 +153,14 @@ class MppiPlannerNode(Node):
             )
 
         # Softmax weights (lower cost = higher weight)
-        weights = np.exp(-costs / self.temperature)
-        weights /= np.sum(weights)
+        # Subtract min cost first to prevent exp underflow when costs are large
+        costs_shifted = costs - np.min(costs)
+        weights = np.exp(-costs_shifted / self.temperature)
+        weight_sum = np.sum(weights)
+        if weight_sum < 1e-10:
+            weights = np.ones(self.num_samples) / self.num_samples
+        else:
+            weights /= weight_sum
 
         # Weighted average over all perturbed sequences
         new_controls = np.zeros((self.horizon, 2))

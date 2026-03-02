@@ -89,7 +89,7 @@ class GoalGenerator(Node):
         self.num_rays = 36                    # number of heading samples [-π, π]
         self.ray_resolution = 0.15            # meters - discretization along ray (0.1-0.2m)
         self.min_horizon = 2.0                # minimum acceptable horizon
-        self.score_threshold = 100.0          # threshold for "no good rays"
+        self.score_threshold = 950.0          # threshold for "no good rays" (must be < feasibility_weight=1000)
         
         # J_geom components (identical for all methods)
         self.collision_weight = 50.0          # penalty for collision/clearance cost
@@ -203,7 +203,7 @@ class GoalGenerator(Node):
         """Get current robot pose in map frame"""
         try:
             transform = self.tf_buffer.lookup_transform(
-                'map', 'odom', rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
+                'map', 'base_link', rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
             )
             
             x = transform.transform.translation.x
@@ -237,13 +237,15 @@ class GoalGenerator(Node):
         # Update last pose
         self.last_robot_pose = self.robot_pose
         
-        # Check if stuck (moved less than 0.1m in last second)
-        if distance_moved < 0.1:
+        # Check if stuck: moved less than 0.05m per callback
+        # At 7Hz and max_speed=0.5m/s, robot moves ~0.07m/callback when moving normally
+        # stuck_counter > 35 = 5 seconds at 7Hz
+        if distance_moved < 0.05:
             self.stuck_counter += 1
         else:
             self.stuck_counter = 0
-        
-        return self.stuck_counter > 5  # Stuck for 5 seconds
+
+        return self.stuck_counter > 35  # Stuck for 5 seconds at 7Hz
 
     def bilinear_sample_risk(self, x: float, y: float) -> float:
         """Bilinear sample risk from grid (for DRaM methods only)"""
@@ -579,12 +581,12 @@ class GoalGenerator(Node):
         # Check if robot is stuck (physical movement)
         is_stuck = self.is_robot_stuck()
         
-        # INTELLIGENT RECOVERY TRIGGERING: Only when ALL 3 directions are blocked
+        # INTELLIGENT RECOVERY TRIGGERING: DRaM only
         should_recover = False
         if 'dram' in self.method_type and self.is_truly_blocked:
             should_recover = True
             self.get_logger().info('🚨 ALL 3 DIRECTIONS BLOCKED - Triggering recovery mode!')
-        elif is_stuck:
+        elif 'dram' in self.method_type and is_stuck:
             should_recover = True
             self.get_logger().info('🚨 ROBOT STUCK - Triggering recovery mode!')
         

@@ -2,8 +2,10 @@
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs.msg import PointCloud2
+import sensor_msgs_py.point_cloud2 as pc2
+# from rclpy.qos import QoSProfile, ReliabilityPolicy
+# from sensor_msgs.msg import PointCloud2, PointField
 import numpy as np
 from std_msgs.msg import Header
 
@@ -12,14 +14,14 @@ class PointCloudSegmenter(Node):
         super().__init__('pointcloud_segmenter')
 
         # BEST_EFFORT matches Isaac Sim and real Ouster driver QoS
-        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+        # qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
         # Subscribe to main point cloud
         self.subscription = self.create_subscription(
             PointCloud2,
             '/os_cloud_node/points',
             self.pointcloud_callback,
-            qos
+            10
         )
         
         # Publishers for segmented point clouds
@@ -32,26 +34,43 @@ class PointCloudSegmenter(Node):
     def pointcloud_callback(self, msg: PointCloud2):
         """Segment point cloud into front, left, right regions"""
         try:
+            points_list = list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))
+            if not points_list:
+                return
             # Parse field offsets from message header — works with any LiDAR format
-            field_offsets = {f.name: f.offset for f in msg.fields if f.name in ('x', 'y', 'z')}
-            if not all(k in field_offsets for k in ('x', 'y', 'z')):
-                self.get_logger().warn('PointCloud2 missing x/y/z fields')
-                return
+            # field_offsets = {f.name: f.offset for f in msg.fields if f.name in ('x', 'y', 'z')}
+            # if not all(k in field_offsets for k in ('x', 'y', 'z')):
+            #     self.get_logger().warn('PointCloud2 missing x/y/z fields')
+            #     return
+            # Convert structured array to regular float array
+            if len(points_list) > 0:
+                # Handle both structured and regular arrays
+                if isinstance(points_list[0], (list, tuple)):
+                    # Regular list/tuple format
+                    points = np.array(points_list, dtype=np.float32)
+                else:
+                    # Structured array format - extract x, y, z
+                    structured_array = np.array(points_list)
+                    points = np.column_stack([
+                        structured_array['x'],
+                        structured_array['y'], 
+                        structured_array['z']
+                    ]).astype(np.float32)
+            else:
+            # n_pts = msg.width * msg.height
+            # if n_pts == 0:
+            #     return
 
-            n_pts = msg.width * msg.height
-            if n_pts == 0:
-                return
+            # raw = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(n_pts, msg.point_step)
+            # x = raw[:, field_offsets['x']:field_offsets['x'] + 4].copy().view(np.float32).flatten()
+            # y = raw[:, field_offsets['y']:field_offsets['y'] + 4].copy().view(np.float32).flatten()
+            # z = raw[:, field_offsets['z']:field_offsets['z'] + 4].copy().view(np.float32).flatten()
+            # points = np.column_stack([x, y, z])
 
-            raw = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(n_pts, msg.point_step)
-            x = raw[:, field_offsets['x']:field_offsets['x'] + 4].copy().view(np.float32).flatten()
-            y = raw[:, field_offsets['y']:field_offsets['y'] + 4].copy().view(np.float32).flatten()
-            z = raw[:, field_offsets['z']:field_offsets['z'] + 4].copy().view(np.float32).flatten()
-            points = np.column_stack([x, y, z])
-
-            # Remove NaN/Inf points
-            valid = np.isfinite(points).all(axis=1)
-            points = points[valid]
-            if len(points) == 0:
+            # # Remove NaN/Inf points
+            # valid = np.isfinite(points).all(axis=1)
+            # points = points[valid]
+            # if len(points) == 0:
                 return
             
             # Calculate angles for each point
@@ -85,7 +104,7 @@ class PointCloudSegmenter(Node):
                 right_msg = self.create_pointcloud2_msg(right_points, msg.header)
                 self.right_pub.publish(right_msg)
                 
-            self.get_logger().info(f'Segmented: Front={len(front_points)}, Left={len(left_points)}, Right={len(right_points)}')
+            self.get_logger().debug(f'Segmented: Front={len(front_points)}, Left={len(left_points)}, Right={len(right_points)}')
             
         except Exception as e:
             self.get_logger().error(f'Error in point cloud segmentation: {e}')
@@ -102,9 +121,9 @@ class PointCloudSegmenter(Node):
         
         # Define fields (x, y, z)
         cloud_msg.fields = [
-            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+            pc2.PointField(name='x', offset=0, datatype=pc2.PointField.FLOAT32, count=1),
+            pc2.PointField(name='y', offset=4, datatype=pc2.PointField.FLOAT32, count=1),
+            pc2.PointField(name='z', offset=8, datatype=pc2.PointField.FLOAT32, count=1),
         ]
         cloud_msg.point_step = 12  # 3 floats * 4 bytes each
         cloud_msg.row_step = cloud_msg.point_step * cloud_msg.width
