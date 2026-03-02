@@ -116,12 +116,17 @@ class GoalGenerator(Node):
         self.last_robot_pose = None
         
         # Path status tracking for proper recovery triggering
-        self.current_path_status = None 
-        
-        
-        #change the threshold for indoor as the detection is poor with the glasses 
+        self.current_path_status = None
+
+        #change the threshold for indoor as the detection is poor with the glasses
         self.path_blocked_threshold = 0.56    # threshold for considering path blocked
         self.is_truly_blocked = False         # all 3 directions blocked
+
+        # Latched recovery waypoint (world-frame, set once, cleared when reached)
+        # Without latching, select_recovery_waypoint() recomputes relative to the
+        # current robot heading every 7Hz callback — as the robot turns, the target
+        # moves with it and the robot spins forever chasing a moving goal.
+        self.active_recovery_waypoint = None
         
         # Create timer for goal generation (5-10 Hz)
         self.create_timer(1.0 / self.goal_generation_rate, self.generate_goal_callback)
@@ -579,17 +584,36 @@ class GoalGenerator(Node):
         """
         Main goal generation callback (5-10 Hz)
         1. Check if ALL 3 camera directions are blocked
-        2. If blocked, use recovery waypoint  
+        2. If blocked, latch a recovery waypoint and keep publishing it until reached
         3. Otherwise, sample headings θ ∈ [-π,π] and pick argmin Score(θ)
         """
         self.robot_pose = self.get_robot_pose()
-        
+
         if self.robot_pose is None:
             return
-        
+
+        robot_x, robot_y, robot_yaw = self.robot_pose
+
+        # ── Latched recovery waypoint ──────────────────────────────────────────
+        # If we already have an active recovery waypoint, keep publishing it until
+        # the robot arrives (< 1 m).  This prevents the target from drifting every
+        # callback as the robot turns (which caused the endless spin).
+        if self.active_recovery_waypoint is not None:
+            rwx, rwy, rwh = self.active_recovery_waypoint
+            dist = math.hypot(robot_x - rwx, robot_y - rwy)
+            if dist < 1.0:
+                self.get_logger().info('✅ Reached recovery point, resuming normal exploration')
+                self.active_recovery_waypoint = None
+                # Fall through to normal exploration this cycle
+            else:
+                self.publish_goal(rwx, rwy, rwh)
+                self.visualize_waypoint(rwx, rwy)
+                return  # Keep heading to the latched point
+        # ───────────────────────────────────────────────────────────────────────
+
         # Check if robot is stuck (physical movement)
         is_stuck = self.is_robot_stuck()
-        
+
         # INTELLIGENT RECOVERY TRIGGERING: DRaM only
         should_recover = False
         if 'dram' in self.method_type and self.is_truly_blocked:
@@ -598,19 +622,20 @@ class GoalGenerator(Node):
         elif 'dram' in self.method_type and is_stuck:
             should_recover = True
             self.get_logger().info('🚨 ROBOT STUCK - Triggering recovery mode!')
-        
+
         waypoint = None
-        
+
         if should_recover:
-            # Use recovery waypoint when truly blocked
+            # Compute recovery waypoint ONCE from current pose and latch it.
             waypoint = self.select_recovery_waypoint()
             if waypoint:
-                self.get_logger().info(f'🚨 Recovery: heading to ({waypoint[0]:.1f}, {waypoint[1]:.1f})')
-        
+                self.active_recovery_waypoint = waypoint  # latch fixed world coords
+                self.get_logger().info(f'🚨 Recovery latched: heading to ({waypoint[0]:.1f}, {waypoint[1]:.1f})')
+
         if waypoint is None:
             # Normal exploration: sample headings, pick argmin θ*
             waypoint = self.sample_exploration_waypoint()
-        
+
         # Publish waypoint as goal
         if waypoint:
             self.publish_goal(waypoint[0], waypoint[1], waypoint[2])
