@@ -13,11 +13,12 @@ Topics published:
   /argus/ar0234_side_left/image_raw    10 Hz  RGB image      (infer_vis.py)
   /argus/ar0234_side_right/image_raw   10 Hz  RGB image      (infer_vis.py)
   /os_cloud_node/points                20 Hz  PointCloud2    (pointcloud_segmenter.py)
+  /scan                                20 Hz  LaserScan      (slam_toolbox)
   /odom_lidar                          60 Hz  Odometry       (goal_generator.py)
 
 TF tree published:
-  odom → base_link          (ROS2PublishOdometry — dynamic, 60 Hz)
-  base_link → lidar         (StaticTransformBroadcaster — fixed mount)
+  odom → base_link          (TransformBroadcaster — dynamic, every frame)
+  base_link → sim_lidar     (StaticTransformBroadcaster — fixed mount)
   base_link → cam_front     (StaticTransformBroadcaster — fixed mount)
   base_link → cam_side_left (StaticTransformBroadcaster — fixed mount)
   base_link → cam_side_right(StaticTransformBroadcaster — fixed mount)
@@ -52,7 +53,7 @@ from omni.isaac.core.utils.stage import get_current_stage
 from omni.isaac.core.utils.types import ArticulationAction
 from omni.isaac.sensor import Camera
 from pxr import Gf, UsdGeom
-from tf2_ros import StaticTransformBroadcaster
+from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 0.5 — JACKAL DIFFERENTIAL DRIVE CONTROLLER
@@ -92,7 +93,7 @@ ROBOT_PRIM = "/World/ground/flat_plane/jackal"
 # ── Set BODY_LINK to the actual physics body prim name found by the snippet ──
 # Common values: "body", "base_link", "chassis"
 # chassisFrameId (ROS TF label) stays "base_link" regardless of BODY_LINK.
-BODY_LINK  = "body"
+BODY_LINK  = "base_link"
 ODOM_PRIM  = f"{ROBOT_PRIM}/{BODY_LINK}"
 
 CAM_FL_PATH = f"{ROBOT_PRIM}/base_link/cam_front"
@@ -101,11 +102,12 @@ CAM_SR_PATH = f"{ROBOT_PRIM}/base_link/cam_side_right"
 LIDAR_PATH  = f"{ROBOT_PRIM}/base_link/lidar"
 GRAPH       = "/World/DRNav_Graph"
 
-TOPIC_CAM_FL = "/argus/ar0234_front_left/image_raw"
-TOPIC_CAM_SL = "/argus/ar0234_side_left/image_raw"
-TOPIC_CAM_SR = "/argus/ar0234_side_right/image_raw"
-TOPIC_LIDAR  = "/os_cloud_node/points"
-TOPIC_ODOM   = "/odom_lidar"
+TOPIC_CAM_FL  = "/argus/ar0234_front_left/image_raw"
+TOPIC_CAM_SL  = "/argus/ar0234_side_left/image_raw"
+TOPIC_CAM_SR  = "/argus/ar0234_side_right/image_raw"
+TOPIC_LIDAR   = "/os_cloud_node/points"
+TOPIC_SCAN    = "/scan"
+TOPIC_ODOM    = "/odom_lidar"
 
 CAM_W, CAM_H = 640, 480
 
@@ -154,27 +156,26 @@ cam_sr = add_camera(CAM_SR_PATH, Gf.Vec3d( 0.00, -0.20, 0.30), Gf.Vec3f(0, 0, -9
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 4 — ADD LiDAR + RENDER PRODUCT
 # ═══════════════════════════════════════════════════════════════════════════════
-# KEY DISCOVERY: in Isaac Sim 4.5, ROS2RtxLidarHelper uses inputs:renderProductPath
-# (NOT inputs:lidarPrimPath which no longer exists).
-# Always use rep.create.render_product() directly — do NOT use
-# get_render_product_path() which returns the viewport camera's render product.
+# One physical lidar, one render product.
+# Two ROS2RtxLidarHelper nodes in the OmniGraph share the same render product:
+#   "lidar"      → /os_cloud_node/points  (PointCloud2, for DR.Nav / infer_vis)
+#   "lidar_scan" → /scan                  (LaserScan,   for SLAM toolbox)
 
-lidar = LidarRtx(
-    prim_path=LIDAR_PATH,
-    name="lidar",
-    translation=Gf.Vec3d(0.0, 0.0, 0.45),
-    config_file_name="OS1_128ch20hz1024res",
+_, sensor = omni.kit.commands.execute(
+    "IsaacSensorCreateRtxLidar",
+    path=LIDAR_PATH,
+    parent=None,
+    config="OS1_REV6_128ch20hz512res",
+    translation=(0.0, 0.0, 0.45),
+    orientation=Gf.Quatd(1, 0, 0, 0),
 )
 
-# Get the render product path the sensor created internally.
-# If get_render_product_path() isn't available, fall back to creating one manually.
-try:
-    lidar_rp_path = lidar.get_render_product_path()
-    print(f"[DR.Nav] LiDAR render product (from sensor): {lidar_rp_path}")
-except AttributeError:
-    lidar_rp = rep.create.render_product(LIDAR_PATH, [1, 1])
-    lidar_rp_path = lidar_rp.path
-    print(f"[DR.Nav] LiDAR render product (created manually): {lidar_rp_path}")
+render_product = rep.create.render_product(sensor.GetPath(), [1, 1])
+
+# Debug draw (optional — shows lidar point cloud in the viewport)
+writer = rep.writers.get("RtxLidarDebugDrawPointCloudBuffer")
+writer.attach(render_product)
+print(f"[DR.Nav] LiDAR render product: {render_product.path}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 5 — CAMERA RENDER PRODUCTS
@@ -187,31 +188,6 @@ print("[DR.Nav] Camera render products created")
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 6 — OMNIGRAPH  (sensors + odometry)
 # ═══════════════════════════════════════════════════════════════════════════════
-# Confirmed attribute names (from discover_attrs.py):
-#
-#   Node                    Attribute                  Note
-#   ──────────────────────────────────────────────────────────────────────────
-#   ROS2RtxLidarHelper      inputs:renderProductPath   NOT lidarPrimPath
-#   ROS2RtxLidarHelper      inputs:type                "point_cloud"
-#   ROS2RtxLidarHelper      inputs:topicName
-#   ROS2RtxLidarHelper      inputs:fullScan
-#   ROS2RtxLidarHelper      inputs:execIn
-#   ROS2PublishOdometry     inputs:topicName           NOT odomTopicName
-#   ROS2PublishOdometry     inputs:chassisFrameId
-#   ROS2PublishOdometry     inputs:odomFrameId
-#   ROS2PublishOdometry     inputs:execIn
-#   ROS2CameraHelper        inputs:renderProductPath
-#   ROS2CameraHelper        inputs:topicName
-#   ROS2CameraHelper        inputs:type
-#   ROS2CameraHelper        inputs:execIn
-#   IsaacComputeOdometry    inputs:execIn only         NO chassisPrimPath in 4.5
-#   IsaacReadSimulationTime  NO execIn                 pure data node
-#
-# NOTE: ROS2PublishTransformTree is intentionally NOT used here.
-#   It publishes the raw USD hierarchy (e.g. "world → body") which is wrong
-#   for SLAM.  Sensor static TFs are published by StaticTransformBroadcaster
-#   in Section 7, and odom→base_link TF comes from ROS2PublishOdometry.
-
 og.Controller.edit(
     {"graph_path": GRAPH, "evaluator_name": "execution"},
     {
@@ -222,21 +198,24 @@ og.Controller.edit(
             ("camsl",       "isaacsim.ros2.bridge.ROS2CameraHelper"),
             ("camsr",       "isaacsim.ros2.bridge.ROS2CameraHelper"),
             ("lidar",       "isaacsim.ros2.bridge.ROS2RtxLidarHelper"),
+            ("lidar_scan",  "isaacsim.ros2.bridge.ROS2RtxLidarHelper"),  # /scan for SLAM
             ("odomcompute", "isaacsim.core.nodes.IsaacComputeOdometry"),
             ("odompub",     "isaacsim.ros2.bridge.ROS2PublishOdometry"),
+            ("clock",       "isaacsim.ros2.bridge.ROS2PublishClock"),
         ],
 
         og.Controller.Keys.CONNECT: [
-            # tick drives all execution nodes
-            # simtime has NO execIn — it is a pure data node
             ("tick.outputs:tick",  "camfl.inputs:execIn"),
             ("tick.outputs:tick",  "camsl.inputs:execIn"),
             ("tick.outputs:tick",  "camsr.inputs:execIn"),
             ("tick.outputs:tick",  "lidar.inputs:execIn"),
+            ("tick.outputs:tick",  "lidar_scan.inputs:execIn"),
             ("tick.outputs:tick",  "odomcompute.inputs:execIn"),
             ("tick.outputs:tick",  "odompub.inputs:execIn"),
+            ("tick.outputs:tick",  "clock.inputs:execIn"),
 
-            ("simtime.outputs:simulationTime",      "odompub.inputs:timeStamp"),
+            ("simtime.outputs:simulationTime", "odompub.inputs:timeStamp"),
+            ("simtime.outputs:simulationTime", "clock.inputs:timeStamp"),
 
             ("odomcompute.outputs:position",        "odompub.inputs:position"),
             ("odomcompute.outputs:orientation",     "odompub.inputs:orientation"),
@@ -258,20 +237,22 @@ og.Controller.edit(
             ("camsr.inputs:topicName",         TOPIC_CAM_SR),
             ("camsr.inputs:type",              "rgb"),
 
-            # LiDAR
+            # LiDAR — PointCloud2 for DR.Nav
             ("lidar.inputs:renderProductPath", render_product.path),
             ("lidar.inputs:topicName",         TOPIC_LIDAR),
             ("lidar.inputs:type",              "point_cloud"),
             ("lidar.inputs:fullScan",          True),
 
+            # LiDAR — LaserScan for SLAM toolbox (same render product, different type)
+            ("lidar_scan.inputs:renderProductPath", render_product.path),
+            ("lidar_scan.inputs:topicName",         TOPIC_SCAN),
+            ("lidar_scan.inputs:type",              "laser_scan"),
+            ("lidar_scan.inputs:fullScan",          True),
+
             # Odometry
-            # NOTE: IsaacComputeOdometry has NO chassisPrimPath in Isaac Sim 4.5
-            # — the node auto-detects the articulation root in the scene.
-            # chassisFrameId = "body" to match mapless.launch.py odom_tf_broadcaster
-            # which subscribes to /odom_lidar and publishes odom → body TF.
-            ("odompub.inputs:topicName",           TOPIC_ODOM),
-            ("odompub.inputs:chassisFrameId",      "body"),
-            ("odompub.inputs:odomFrameId",         "odom"),
+            ("odompub.inputs:topicName",      TOPIC_ODOM),
+            ("odompub.inputs:chassisFrameId", "base_link"),
+            ("odompub.inputs:odomFrameId",    "odom"),
         ],
     }
 )
@@ -301,22 +282,13 @@ _ros_node.create_subscription(Twist, "/cmd_vel", _cmd_vel_cb, 10)
 print("[DR.Nav] Subscribed to /cmd_vel")
 
 # ── 7b. Static TF: base_link → sensors ───────────────────────────────────────
-# These are fixed sensor mounts — published once to /tf_static.
-# TF buffer stores them permanently (no timeout), so SLAM always has them.
-# Dynamic TF (odom → base_link) comes from ROS2PublishOdometry above.
-#
-# Full SLAM TF chain:
-#   map → odom → base_link → lidar
-#                           → cam_front / cam_side_left / cam_side_right
-#   map→odom    : published by SLAM
-#   odom→base_link : ROS2PublishOdometry (dynamic, 60 Hz)
-#   base_link→*    : StaticTransformBroadcaster below (fixed mount, once)
-
 def _make_static_tf(parent, child, x, y, z, qx=0.0, qy=0.0, qz=0.0, qw=1.0):
     t = TransformStamped()
-    t.header.stamp       = _ros_node.get_clock().now().to_msg()
-    t.header.frame_id    = parent
-    t.child_frame_id     = child
+    _sim_t = omni.timeline.get_timeline_interface().get_current_time()
+    t.header.stamp.sec     = int(_sim_t)
+    t.header.stamp.nanosec = int((_sim_t % 1) * 1e9)
+    t.header.frame_id  = parent
+    t.child_frame_id   = child
     t.transform.translation.x = x
     t.transform.translation.y = y
     t.transform.translation.z = z
@@ -328,31 +300,20 @@ def _make_static_tf(parent, child, x, y, z, qx=0.0, qy=0.0, qz=0.0, qw=1.0):
 
 _static_br = StaticTransformBroadcaster(_ros_node)
 _static_br.sendTransform([
-    # lidar: 0.3 m forward, 0.1 m up, no rotation
-    _make_static_tf("base_link", "lidar",           0.30,  0.00, 0.10),
-    # front cam: slight left offset, facing forward (no rotation)
-    _make_static_tf("base_link", "cam_front",       0.40,  0.15, 0.30),
-    # side-left cam: 90° yaw → qz=sin(45°)=0.7071, qw=cos(45°)=0.7071
-    _make_static_tf("base_link", "cam_side_left",   0.00,  0.20, 0.30,
+    _make_static_tf("base_link", "sim_lidar",      0.00,  0.00, 0.45),
+    _make_static_tf("base_link", "cam_front",      0.40,  0.15, 0.30),
+    _make_static_tf("base_link", "cam_side_left",  0.00,  0.20, 0.30,
                     0.0, 0.0,  0.7071, 0.7071),
-    # side-right cam: -90° yaw → qz=-0.7071, qw=0.7071
-    _make_static_tf("base_link", "cam_side_right",  0.00, -0.20, 0.30,
+    _make_static_tf("base_link", "cam_side_right", 0.00, -0.20, 0.30,
                     0.0, 0.0, -0.7071, 0.7071),
 ])
-print("[DR.Nav] Static TFs published: base_link → lidar / cam_*")
+print("[DR.Nav] Static TFs published: base_link → sim_lidar / cam_*")
 
 # ── 7c. Jackal articulation controller ───────────────────────────────────────
-# Uses omni.kit.app update stream (NOT World.add_physics_callback) because
-# _physx_interface is None until physics actually starts after play().
-# The articulation is initialized lazily on the first frame.
+_jackal       = Articulation(prim_path=ROBOT_PRIM)
+_controller   = JackalController()
+_jackal_ready = [False]
 
-_jackal        = Articulation(prim_path=ROBOT_PRIM)
-_controller    = JackalController()
-_jackal_ready  = [False]
-
-# Dynamic TF broadcaster: publishes odom → base_link every frame.
-# ROS2PublishOdometry only publishes nav_msgs/Odometry — it does NOT
-# auto-publish TF in Isaac Sim 4.5, so we do it here instead.
 _tf_broadcaster = TransformBroadcaster(_ros_node)
 
 try:
@@ -361,7 +322,6 @@ except (NameError, Exception):
     pass
 
 def _jackal_step(dt):
-    # Process one pending /cmd_vel message (non-blocking)
     rclpy.spin_once(_ros_node, timeout_sec=0)
 
     if not _jackal_ready[0]:
@@ -370,16 +330,17 @@ def _jackal_step(dt):
             _jackal_ready[0] = True
             print("[DR.Nav] Jackal articulation initialized")
         except Exception:
-            return   # physics not ready yet — retry next frame
+            return
         return
 
-    # ── Publish odom → base_link TF ──────────────────────────────────────
-    # get_world_pose() returns (position [x,y,z], orientation [w,x,y,z])
+    # Publish odom → base_link TF
     pos, ori = _jackal.get_world_pose()
     t = TransformStamped()
-    t.header.stamp       = _ros_node.get_clock().now().to_msg()
-    t.header.frame_id    = "odom"
-    t.child_frame_id     = "base_link"
+    _sim_t = omni.timeline.get_timeline_interface().get_current_time()
+    t.header.stamp.sec     = int(_sim_t)
+    t.header.stamp.nanosec = int((_sim_t % 1) * 1e9)
+    t.header.frame_id  = "odom"
+    t.child_frame_id   = "base_link"
     t.transform.translation.x = float(pos[0])
     t.transform.translation.y = float(pos[1])
     t.transform.translation.z = float(pos[2])
@@ -390,7 +351,7 @@ def _jackal_step(dt):
     t.transform.rotation.z = float(ori[3])
     _tf_broadcaster.sendTransform(t)
 
-    # ── Drive robot from /cmd_vel ─────────────────────────────────────────
+    # Drive robot from /cmd_vel
     lin = _latest_twist.linear.x
     ang = _latest_twist.angular.z
     _jackal.apply_action(_controller.forward(command=[lin, ang]))
@@ -416,11 +377,12 @@ Verify in a terminal:
   ros2 topic list
   ros2 topic hz /argus/ar0234_front_left/image_raw   # expect ~10 Hz
   ros2 topic hz /os_cloud_node/points                # expect ~20 Hz
+  ros2 topic hz /scan                                # expect ~20 Hz
   ros2 topic hz /odom_lidar                          # expect ~60 Hz
 
 Verify TF chain:
-  ros2 run tf2_ros tf2_echo odom base_link           # dynamic, ~60 Hz
-  ros2 run tf2_ros tf2_echo base_link lidar          # static, always valid
+  ros2 run tf2_ros tf2_echo odom base_link           # dynamic, every frame
+  ros2 run tf2_ros tf2_echo base_link sim_lidar      # static, always valid
   ros2 run tf2_tools view_frames                     # full TF tree PDF
 
 Control robot:
