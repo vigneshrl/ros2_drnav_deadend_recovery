@@ -96,7 +96,7 @@ class GoalGenerator(Node):
         self.feasibility_weight = 1000.0      # huge penalty if ray hits obstacle before R
         self.smoothness_weight = 0.5          # yaw change penalty to avoid twitch
         self.range_bias_weight = 0.1          # light penalty for very short rays
-        self.inflation_radius = 0.3           # robot inflation radius
+        self.inflation_radius = 0.35          # Jackal half-diagonal (0.33 m) + 2 cm margin
         
         # Recovery scoring parameters (same α,β,γ,δ for all)
         self.alpha_progress = 1.0             # goal progress weight
