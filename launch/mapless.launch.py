@@ -52,19 +52,6 @@ def launch_setup(context, *args, **kwargs):
     cfg = METHOD_CONFIG[method]
     nodes = []
 
-    # ── Always: odom → body TF broadcaster ──────────────────────────────────
-    nodes.append(Node(
-        package='map_contruct',
-        executable='odom_tf_broadcaster',
-        name='odom_tf_broadcaster',
-        output='screen',
-        parameters=[{
-            'odom_topic':   '/odom_lidar',
-            'parent_frame': 'odom',
-            'child_frame':  'body',
-        }]
-    ))
-
     # ── Always: goal generator ───────────────────────────────────────────────
     nodes.append(Node(
         package='map_contruct',

@@ -440,7 +440,7 @@ class DRaMRiskMap(Node):
     def _get_robot_position(self):
         try:
             t = self.tf_buffer.lookup_transform(
-                'map', 'body', rclpy.time.Time(),
+                'map', 'base_link', rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.1)
             )
             return (
@@ -450,7 +450,7 @@ class DRaMRiskMap(Node):
                 'map'
             )
         except Exception:
-            return (0.0, 0.0, 0.0, 'body')
+            return (0.0, 0.0, 0.0, 'map')
 
 
 def main(args=None):

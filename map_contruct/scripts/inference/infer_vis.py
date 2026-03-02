@@ -151,12 +151,16 @@ class DeadEndDetectionNodeWithVisualization(Node):
         
         # Initialize synchronization - adjust for robot mode
         self.last_processed_time = 0
-        _deafult_interval = 0.1 if self.robot_mode else 0.2  # Slower processing for robot mode
-        self.processing_interval = 0.1 if self.robot_mode else 0.2
+        _default_interval = 0.1 if self.robot_mode else 0.2
+        self.processing_interval = self.declare_parameter(
+            'processing_interval', _default_interval
+        ).get_parameter_value().double_value
+
         self.get_logger().info('🚀 Dead End Detection Node with Visualization initialized')
         if hasattr(self, 'output_dir'):
             self.get_logger().info(f'📁 Output directory: {self.output_dir}')
         self.get_logger().info(f'🤖 Robot mode: {self.robot_mode}, Save visualizations: {self.save_visualizations}')
+        self.get_logger().info(f'⏱  Processing interval: {self.processing_interval:.3f}s  (~{1.0/self.processing_interval:.1f} Hz)')
         self.get_logger().info(f'⚡ Processing interval: {self.processing_interval}s ({1.0/self.processing_interval:.1f} Hz)')
         # self.get_logger().info(f'📡 Queue size: {queue_size}, Device: {self.device}')
         

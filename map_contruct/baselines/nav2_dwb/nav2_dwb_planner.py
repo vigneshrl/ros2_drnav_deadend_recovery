@@ -86,7 +86,7 @@ class Nav2DwbPlannerNode(Node):
     def get_robot_pose(self):
         try:
             transform = self.tf_buffer.lookup_transform(
-                'map', 'odom', rclpy.time.Time(),
+                'map', 'base_link', rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.1)
             )
             x = transform.transform.translation.x
