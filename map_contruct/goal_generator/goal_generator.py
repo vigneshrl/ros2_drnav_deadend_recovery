@@ -335,14 +335,23 @@ class GoalGenerator(Node):
         # Sample points along the ray
         num_samples = int(distance / self.ray_resolution)
         
+        # Perpendicular unit vector (rotated 90° from heading) for footprint check
+        perp_x = -math.sin(heading) * self.inflation_radius
+        perp_y =  math.cos(heading) * self.inflation_radius
+
         for i in range(1, num_samples + 1):
             # Calculate point along ray
             sample_distance = i * self.ray_resolution
             sample_x = start_x + sample_distance * math.cos(heading)
             sample_y = start_y + sample_distance * math.sin(heading)
-            
-            # Feasibility: check if ray hits obstacle before R
-            if self.is_point_occupied(sample_x, sample_y):
+
+            # Feasibility: check robot footprint width, not just the ray centre.
+            # Without this, a ray through a gap narrower than the robot body is
+            # marked feasible and the waypoint is placed through it — the local
+            # planner then drives into the walls on either side.
+            if (self.is_point_occupied(sample_x, sample_y) or
+                    self.is_point_occupied(sample_x + perp_x, sample_y + perp_y) or
+                    self.is_point_occupied(sample_x - perp_x, sample_y - perp_y)):
                 feasible = False
                 actual_distance = sample_distance
                 break
