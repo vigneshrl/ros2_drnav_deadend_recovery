@@ -98,7 +98,24 @@ class MppiPlannerNode(Node):
             return 0.0, 0.0, 0.0, False
 
     def is_occupied(self, x, y):
-        """Check if a world-frame point is occupied in the occupancy grid."""
+        """Check if the Jackal footprint centered at (x, y) hits any obstacle.
+
+        Checks 9 points: center + 8 points at 0.30 m radius (Jackal half-width
+        ~0.25 m + 0.05 m margin). Without this, the planner only checks the
+        robot centre, so trajectories passing within one body-width of a wall
+        score as collision-free and the robot drives into the wall.
+        """
+        r = 0.30
+        s = 0.7071  # sin/cos 45 deg
+        for dx, dy in [(0.0, 0.0),
+                       ( r,  0.0), (-r,  0.0), (0.0,  r), (0.0, -r),
+                       ( r*s,  r*s), (-r*s,  r*s),
+                       ( r*s, -r*s), (-r*s, -r*s)]:
+            if self._cell_occupied(x + dx, y + dy):
+                return True
+        return False
+
+    def _cell_occupied(self, x, y):
         if self.occupancy_grid is None:
             return False
         info = self.occupancy_grid.info
