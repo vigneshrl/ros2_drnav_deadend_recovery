@@ -152,7 +152,11 @@ class DwaPlannerNode(Node):
                     x += v * math.cos(theta) * self.dt
                     y += v * math.sin(theta) * self.dt
                     theta += omega * self.dt
-                    if self.is_occupied(x, y):
+                    # Skip footprint check when robot hasn't moved from its current
+                    # position (v=0 rotation-in-place). The robot is already safely
+                    # at that position, so checking the footprint there wrongly flags
+                    # all turning trajectories as collision when near a wall.
+                    if math.hypot(x - robot_x, y - robot_y) > 0.10 and self.is_occupied(x, y):
                         collision = True
                         break
 

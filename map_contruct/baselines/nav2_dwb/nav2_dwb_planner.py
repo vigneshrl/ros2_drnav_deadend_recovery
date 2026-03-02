@@ -199,7 +199,10 @@ class Nav2DwbPlannerNode(Node):
             x += vx * math.cos(theta) * self.sim_granularity
             y += vx * math.sin(theta) * self.sim_granularity
             theta += vtheta * self.sim_granularity
-            if self.is_occupied(x, y):
+            # Skip footprint check when robot hasn't moved from start — checking
+            # footprint at the current position wrongly blocks all rotation-in-place
+            # trajectories when the robot is within 0.30 m of a wall.
+            if math.hypot(x - start_x, y - start_y) > 0.10 and self.is_occupied(x, y):
                 return -float('inf')  # discard colliding trajectories
 
         # Path distance score: how close the trajectory end is to the goal

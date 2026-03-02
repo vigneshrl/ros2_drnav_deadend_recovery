@@ -202,8 +202,10 @@ class MppiPlannerNode(Node):
             y += v_seq[t] * math.sin(theta) * self.dt
             theta += w_seq[t] * self.dt
 
-            # Collision cost
-            if self.is_occupied(x, y):
+            # Collision cost — skip check when robot hasn't moved from start
+            # (low-v or pure-rotation trajectories). Checking footprint at the
+            # starting position wrongly flags them as collision when near a wall.
+            if math.hypot(x - start_x, y - start_y) > 0.10 and self.is_occupied(x, y):
                 return self.collision_cost * (self.horizon - t)  # early exit, large penalty
 
             # Goal cost
