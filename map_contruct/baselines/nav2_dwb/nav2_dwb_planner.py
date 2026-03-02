@@ -199,10 +199,9 @@ class Nav2DwbPlannerNode(Node):
             x += vx * math.cos(theta) * self.sim_granularity
             y += vx * math.sin(theta) * self.sim_granularity
             theta += vtheta * self.sim_granularity
-            # Skip footprint check when robot hasn't moved from start — checking
-            # footprint at the current position wrongly blocks all rotation-in-place
-            # trajectories when the robot is within 0.30 m of a wall.
-            if math.hypot(x - start_x, y - start_y) > 0.10 and self.is_occupied(x, y):
+            # For vx=0 (rotation-in-place) position never changes, so
+            # is_occupied would wrongly flag nearby walls at every step.
+            if vx > 1e-9 and self.is_occupied(x, y):
                 return -float('inf')  # discard colliding trajectories
 
         # Path distance score: how close the trajectory end is to the goal
@@ -213,9 +212,11 @@ class Nav2DwbPlannerNode(Node):
         goal_dist = np.hypot(start_x - goal_x, start_y - goal_y)
         goal_score = -goal_dist * self.goal_distance_bias
 
-        # Goal alignment score: penalise being turned away from goal
+        # Goal alignment score: use final theta (after trajectory), not start_theta.
+        # Using start_theta meant all rotation-in-place trajectories scored identically
+        # regardless of omega, so omega=0 always won and the robot never turned.
         goal_angle = math.atan2(goal_y - start_y, goal_x - start_x)
-        angle_diff = abs(self._normalize_angle(start_theta - goal_angle))
+        angle_diff = abs(self._normalize_angle(theta - goal_angle))
         alignment_score = -angle_diff * 10.0
 
         # Speed preference: encourage moving forward

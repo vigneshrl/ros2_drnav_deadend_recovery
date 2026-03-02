@@ -143,6 +143,9 @@ class DwaPlannerNode(Node):
         best_score = -float('inf')
         best_v, best_omega = 0.0, 0.0
 
+        # Precompute goal direction for heading alignment
+        goal_angle = math.atan2(target_y - robot_y, target_x - robot_x)
+
         for v in np.linspace(0.0, self.max_speed, self.v_samples):
             for omega in np.linspace(-self.max_omega, self.max_omega, self.omega_samples):
                 x, y, theta = robot_x, robot_y, robot_theta
@@ -152,11 +155,10 @@ class DwaPlannerNode(Node):
                     x += v * math.cos(theta) * self.dt
                     y += v * math.sin(theta) * self.dt
                     theta += omega * self.dt
-                    # Skip footprint check when robot hasn't moved from its current
-                    # position (v=0 rotation-in-place). The robot is already safely
-                    # at that position, so checking the footprint there wrongly flags
-                    # all turning trajectories as collision when near a wall.
-                    if math.hypot(x - robot_x, y - robot_y) > 0.10 and self.is_occupied(x, y):
+                    # For v=0 (rotation-in-place) position never changes, so
+                    # is_occupied would wrongly flag nearby walls at every step.
+                    # Skip the check — the robot is already safely at that spot.
+                    if v > 1e-9 and self.is_occupied(x, y):
                         collision = True
                         break
 
@@ -165,8 +167,16 @@ class DwaPlannerNode(Node):
 
                 goal_dist = np.hypot(x - target_x, y - target_y)
                 goal_score = -goal_dist * self.goal_weight
+
+                # Heading alignment: reward the trajectory that ends with the
+                # robot facing the goal. Without this, all v=0 trajectories have
+                # the same goal_dist, so omega=0 always wins (lowest turn_penalty)
+                # and the robot freezes instead of rotating toward the goal.
+                heading_diff = abs(self._normalize_angle(theta - goal_angle))
+                heading_score = -heading_diff * 1.5
+
                 turn_penalty = abs(omega) * self.turn_weight
-                total_score = goal_score - turn_penalty
+                total_score = goal_score + heading_score - turn_penalty
 
                 if total_score > best_score:
                     best_score = total_score
@@ -180,6 +190,13 @@ class DwaPlannerNode(Node):
 
         self._update_metrics(robot_x, robot_y)
         self.last_pose = (robot_x, robot_y)
+
+    def _normalize_angle(self, angle):
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
 
     def _update_metrics(self, robot_x, robot_y):
         if self.last_pose is not None:

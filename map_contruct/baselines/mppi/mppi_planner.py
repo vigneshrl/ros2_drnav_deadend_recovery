@@ -202,10 +202,9 @@ class MppiPlannerNode(Node):
             y += v_seq[t] * math.sin(theta) * self.dt
             theta += w_seq[t] * self.dt
 
-            # Collision cost — skip check when robot hasn't moved from start
-            # (low-v or pure-rotation trajectories). Checking footprint at the
-            # starting position wrongly flags them as collision when near a wall.
-            if math.hypot(x - start_x, y - start_y) > 0.10 and self.is_occupied(x, y):
+            # For v=0 (rotation-in-place) position never changes, so
+            # is_occupied would wrongly flag nearby walls at every step.
+            if v_seq[t] > 1e-9 and self.is_occupied(x, y):
                 return self.collision_cost * (self.horizon - t)  # early exit, large penalty
 
             # Goal cost
@@ -219,9 +218,23 @@ class MppiPlannerNode(Node):
                 total_cost += ((v_seq[t] - v_seq[t-1]) ** 2 +
                                (w_seq[t] - w_seq[t-1]) ** 2) * self.smooth_weight
 
-        # Terminal cost (heavier weight on final position)
+        # Terminal cost: position + heading alignment.
+        # The heading term gives different costs to different omega values even
+        # when v=0 (position unchanged). Without it, all rotation-in-place
+        # trajectories score identically so the weighted average omega≈0 and
+        # the robot never turns toward the goal.
         total_cost += np.hypot(x - goal_x, y - goal_y) * self.goal_weight * 2.0
+        final_angle = math.atan2(goal_y - y, goal_x - x)
+        heading_err = abs(self._normalize_angle(theta - final_angle))
+        total_cost += heading_err * 1.0
         return total_cost
+
+    def _normalize_angle(self, angle):
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
 
     def _update_metrics(self, robot_x, robot_y):
         if self.last_pose is not None:
