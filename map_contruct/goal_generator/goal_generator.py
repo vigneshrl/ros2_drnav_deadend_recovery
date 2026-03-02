@@ -127,6 +127,15 @@ class GoalGenerator(Node):
         # current robot heading every 7Hz callback — as the robot turns, the target
         # moves with it and the robot spins forever chasing a moving goal.
         self.active_recovery_waypoint = None
+
+        # Goal-stale detection: if sample_exploration_waypoint() returns the same
+        # direction for too many consecutive callbacks the robot is physically stuck
+        # (inflated map blocks the corridor) even though the model hasn't flagged it
+        # as a dead end.  Trigger recovery after ~1.4 s (10 × 1/7 Hz) rather than
+        # waiting 5 s for is_robot_stuck() to fire.
+        self.last_exploration_goal = None       # (x, y) of last published exploration goal
+        self.consecutive_same_goal = 0          # how many callbacks in a row
+        self.same_goal_threshold = 10           # callbacks before forced recovery (~1.4 s)
         
         # Create timer for goal generation (5-10 Hz)
         self.create_timer(1.0 / self.goal_generation_rate, self.generate_goal_callback)
@@ -613,7 +622,9 @@ class GoalGenerator(Node):
             if dist < 1.0:
                 self.get_logger().info('✅ Reached recovery point, resuming normal exploration')
                 self.active_recovery_waypoint = None
-                self.stuck_counter = 0  # reset so is_robot_stuck() doesn't re-trigger immediately
+                self.stuck_counter = 0          # reset so is_robot_stuck() doesn't re-trigger immediately
+                self.consecutive_same_goal = 0  # reset goal-stale counter too
+                self.last_exploration_goal = None
                 # Fall through to normal exploration this cycle
             else:
                 self.publish_goal(rwx, rwy, rwh)
@@ -632,6 +643,10 @@ class GoalGenerator(Node):
         elif 'dram' in self.method_type and is_stuck:
             should_recover = True
             self.get_logger().info('🚨 ROBOT STUCK - Triggering recovery mode!')
+        elif 'dram' in self.method_type and self.consecutive_same_goal >= self.same_goal_threshold:
+            should_recover = True
+            self.consecutive_same_goal = 0
+            self.get_logger().info(f'🚨 GOAL STALE ({self.same_goal_threshold} callbacks) - Triggering recovery mode!')
 
         waypoint = None
 
@@ -645,6 +660,24 @@ class GoalGenerator(Node):
         if waypoint is None:
             # Normal exploration: sample headings, pick argmin θ*
             waypoint = self.sample_exploration_waypoint()
+
+            # Track how many consecutive callbacks produce the same goal direction.
+            # The model may not detect a narrow corridor as a dead end (giving
+            # false-positive "open" scores), so we detect the stale goal purely
+            # from geometry and trigger recovery before the 5-second is_stuck timer.
+            if waypoint is not None:
+                wx, wy, _ = waypoint
+                if self.last_exploration_goal is not None:
+                    dist = math.hypot(wx - self.last_exploration_goal[0],
+                                      wy - self.last_exploration_goal[1])
+                    if dist < 0.5:
+                        self.consecutive_same_goal += 1
+                    else:
+                        self.consecutive_same_goal = 0
+                self.last_exploration_goal = (wx, wy)
+        else:
+            # Recovery or exploration found a different goal — reset stale counter
+            self.consecutive_same_goal = 0
 
         # Publish waypoint as goal
         if waypoint:
