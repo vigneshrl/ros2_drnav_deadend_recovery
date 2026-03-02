@@ -10,6 +10,7 @@ import math
 import time
 import json
 import os
+from scipy.ndimage import binary_dilation
 
 
 class Nav2DwbPlannerNode(Node):
@@ -41,6 +42,8 @@ class Nav2DwbPlannerNode(Node):
         self.current_goal = None
         self.occupancy_grid = None
         self.current_vel = {'x': 0.0, 'theta': 0.0}
+        self.inflated_mask = None          # precomputed inflated occupancy (numpy bool)
+        self.inflation_radius = 0.35       # Jackal half-diagonal (0.33 m) + 2 cm margin
 
         # Nav2 DWB parameters
         self.max_vel_x = 0.5
@@ -82,6 +85,16 @@ class Nav2DwbPlannerNode(Node):
 
     def map_callback(self, msg):
         self.occupancy_grid = msg
+        self._rebuild_inflated_grid()
+
+    def _rebuild_inflated_grid(self):
+        """Dilate every occupied cell by the robot radius once per map update."""
+        info = self.occupancy_grid.info
+        raw = np.array(self.occupancy_grid.data, dtype=np.int8).reshape(
+            (info.height, info.width))
+        occupied = raw > 50
+        cells = int(math.ceil(self.inflation_radius / info.resolution))
+        self.inflated_mask = binary_dilation(occupied, iterations=cells)
 
     def get_robot_pose(self):
         try:
@@ -101,33 +114,15 @@ class Nav2DwbPlannerNode(Node):
             return 0.0, 0.0, 0.0, False
 
     def is_occupied(self, x, y):
-        """Check if the Jackal footprint centered at (x, y) hits any obstacle.
-
-        Checks 9 points: center + 8 points at 0.30 m radius (Jackal half-width
-        ~0.25 m + 0.05 m margin). Without this, the planner only checks the
-        robot centre, so trajectories passing within one body-width of a wall
-        score as collision-free and the robot drives into the wall.
-        """
-        r = 0.30
-        s = 0.7071  # sin/cos 45 deg
-        for dx, dy in [(0.0, 0.0),
-                       ( r,  0.0), (-r,  0.0), (0.0,  r), (0.0, -r),
-                       ( r*s,  r*s), (-r*s,  r*s),
-                       ( r*s, -r*s), (-r*s, -r*s)]:
-            if self._cell_occupied(x + dx, y + dy):
-                return True
-        return False
-
-    def _cell_occupied(self, x, y):
-        if self.occupancy_grid is None:
+        """Return True if the inflated map marks (x, y) as no-go."""
+        if self.inflated_mask is None or self.occupancy_grid is None:
             return False
         info = self.occupancy_grid.info
         gx = int((x - info.origin.position.x) / info.resolution)
         gy = int((y - info.origin.position.y) / info.resolution)
         if gx < 0 or gx >= info.width or gy < 0 or gy >= info.height:
             return True
-        idx = gy * info.width + gx
-        return self.occupancy_grid.data[idx] > 50
+        return bool(self.inflated_mask[gy, gx])
 
     def plan_and_publish(self):
         robot_x, robot_y, robot_theta, ok = self.get_robot_pose()
