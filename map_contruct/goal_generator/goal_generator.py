@@ -535,25 +535,34 @@ class GoalGenerator(Node):
         """
         if self.robot_pose is None:
             return None
-        
+
         robot_x, robot_y, robot_yaw = self.robot_pose
         candidates = []
-        
-        # Use recovery points if available (DRaM methods)
+
+        # Minimum distance a recovery point must be from the robot.
+        # Points closer than this are useless — the DWA's 1 m goal-reached
+        # threshold means the robot never has to move to "reach" them, which
+        # causes the recovery→clear→re-trigger loop seen in the logs.
+        min_recovery_dist = 2.0
+
+        # Use semantic recovery points from dram_risk_map if any are far enough
         if self.recovery_points:
             for rp in self.recovery_points:
-                candidates.append((rp['x'], rp['y']))
-        else:
-            # Generate recovery candidates behind & to the sides (LiDAR methods)
-            recovery_distance = 2.0  # meters behind
-            recovery_angles = [math.pi, 3*math.pi/4, 5*math.pi/4, math.pi/2, -math.pi/2]  # Behind, diagonals, sides
-            
+                dist = math.hypot(rp['x'] - robot_x, rp['y'] - robot_y)
+                if dist >= min_recovery_dist:
+                    candidates.append((rp['x'], rp['y']))
+
+        # Fall back to geometric candidates (works for all methods, and whenever
+        # the semantic points are all too close to the robot)
+        if not candidates:
+            recovery_distance = 2.0  # meters behind / to the sides
+            recovery_angles = [math.pi, 3*math.pi/4, 5*math.pi/4, math.pi/2, -math.pi/2]
+
             for angle_offset in recovery_angles:
                 candidate_heading = robot_yaw + angle_offset
                 candidate_x = robot_x + recovery_distance * math.cos(candidate_heading)
                 candidate_y = robot_y + recovery_distance * math.sin(candidate_heading)
-                
-                # Check if candidate is not occupied
+
                 if not self.is_point_occupied(candidate_x, candidate_y):
                     candidates.append((candidate_x, candidate_y))
         
@@ -604,6 +613,7 @@ class GoalGenerator(Node):
             if dist < 1.0:
                 self.get_logger().info('✅ Reached recovery point, resuming normal exploration')
                 self.active_recovery_waypoint = None
+                self.stuck_counter = 0  # reset so is_robot_stuck() doesn't re-trigger immediately
                 # Fall through to normal exploration this cycle
             else:
                 self.publish_goal(rwx, rwy, rwh)
