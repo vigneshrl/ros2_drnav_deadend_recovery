@@ -287,28 +287,55 @@ def compute_metrics(bag_path, de_min_duration_s=2.0, pad_lookahead_s=10.0,
         idx = max(0, min(idx, len(poses) - 1))
         return (float(pose_x[idx]), float(pose_y[idx]))
 
-    # Detect dead-end episodes
-    episodes = []
-    ep_start_ts  = None
-    ep_start_pos = None
-    prev_de = False
+    # Detect dead-end episodes and measure time-to-exit / recovery success
+    # A recovery is "successful" when:
+    #   - is_dead_end returns to False (robot exited)
+    #   - robot has moved > exit_dist_m from the mouth position
+    exit_dist_m = 1.0   # metres robot must move away from mouth to count as exited
+
+    episodes        = []
+    ep_start_ts     = None
+    ep_start_pos    = None
+    ep_end_ts       = None
+    prev_de         = False
+    n_recovered     = 0
+    exit_times      = []   # seconds from mouth to exit for successful recoveries
 
     for ts, is_de in de_flags:
         if is_de and not prev_de:
             ep_start_ts  = ts
             ep_start_pos = robot_pos_at(ts)
+            ep_end_ts    = None
         elif not is_de and prev_de and ep_start_ts is not None:
-            if (ts - ep_start_ts) * 1e-9 >= de_min_duration_s:
-                episodes.append({'mouth_pos': ep_start_pos,
-                                  'mouth_ts':  ep_start_ts})
+            ep_end_ts = ts
+            duration_ep = (ep_end_ts - ep_start_ts) * 1e-9
+            if duration_ep >= de_min_duration_s:
+                exit_pos = robot_pos_at(ep_end_ts)
+                exited   = _dist(exit_pos, ep_start_pos) >= exit_dist_m
+                episodes.append({'mouth_pos':  ep_start_pos,
+                                  'mouth_ts':   ep_start_ts,
+                                  'end_ts':     ep_end_ts,
+                                  'exited':     exited,
+                                  'duration':   duration_ep})
+                if exited:
+                    n_recovered += 1
+                    exit_times.append(duration_ep)
             ep_start_ts = None
         prev_de = is_de
 
-    # Handle episode still open at end of bag
+    # Handle episode still open at end of bag (robot never exited)
     if prev_de and ep_start_ts is not None:
-        if (poses[-1][0] - ep_start_ts) * 1e-9 >= de_min_duration_s:
+        duration_ep = (poses[-1][0] - ep_start_ts) * 1e-9
+        if duration_ep >= de_min_duration_s:
             episodes.append({'mouth_pos': ep_start_pos,
-                              'mouth_ts':  ep_start_ts})
+                              'mouth_ts':  ep_start_ts,
+                              'end_ts':    None,
+                              'exited':    False,
+                              'duration':  duration_ep})
+
+    n_dead_ends   = len(episodes)
+    recovery_rate = n_recovered / n_dead_ends if n_dead_ends > 0 else float('nan')
+    mean_exit_t   = float(np.mean(exit_times)) if exit_times else float('nan')
 
     pad_values = []
     turn_thresh_rad = math.radians(turn_threshold_deg)
@@ -355,13 +382,15 @@ def compute_metrics(bag_path, de_min_duration_s=2.0, pad_lookahead_s=10.0,
     pad = float(np.mean(pad_values)) if pad_values else float('nan')
 
     return {
-        'dist':        total_dist,
-        'speed':       avg_speed,
-        'efficiency':  efficiency,
-        'npr':         npr,
-        'pad':         pad,
-        'duration':    duration_s,
-        'n_dead_ends': len(episodes),
+        'dist':          total_dist,
+        'speed':         avg_speed,
+        'efficiency':    efficiency,
+        'npr':           npr,
+        'pad':           pad,
+        'duration':      duration_s,
+        'n_dead_ends':   n_dead_ends,
+        'recovery_rate': recovery_rate,   # fraction of episodes robot exited
+        'mean_exit_t':   mean_exit_t,     # mean seconds from detection to exit
     }
 
 
@@ -397,10 +426,12 @@ def main():
             )
             if r is not None:
                 results.append(r)
-                pad_str = f"{r['pad']:.2f}" if not math.isnan(r['pad']) else "n/a"
+                pad_str = f"{r['pad']:.2f}"   if not math.isnan(r['pad'])           else "n/a"
+                rr_str  = f"{r['recovery_rate']*100:.0f}%" if not math.isnan(r['recovery_rate']) else "n/a"
+                te_str  = f"{r['mean_exit_t']:.1f}s"      if not math.isnan(r['mean_exit_t'])    else "n/a"
                 print(f"  dist={r['dist']:.1f}m  speed={r['speed']:.3f}m/s  "
                       f"eff={r['efficiency']:.3f}  PAD={pad_str}m  NPR={r['npr']:.2f}  "
-                      f"dead_ends={r['n_dead_ends']}")
+                      f"dead_ends={r['n_dead_ends']}  recovery={rr_str}  exit_t={te_str}")
         except Exception as e:
             print(f"  ERROR: {e}")
             import traceback; traceback.print_exc()
@@ -419,15 +450,24 @@ def main():
     ef_m, ef_s = _agg('efficiency')
     np_m, np_s = _agg('npr')
     pa_m, pa_s = _agg('pad')
+    rr_m, rr_s = _agg('recovery_rate')
+    te_m, te_s = _agg('mean_exit_t')
+    total_de   = sum(r['n_dead_ends'] for r in results)
 
     print(f"\n{'='*62}")
     print(f"  Method : {args.method}   ({len(results)} run(s))")
     print(f"{'='*62}")
-    print(f"  Distance   (↓) : {d_m:7.1f} ± {d_s:.1f} m")
-    print(f"  Speed    (↑)   : {sp_m:.3f} ± {sp_s:.3f} m/s")
-    print(f"  Efficiency (↑) : {ef_m:.3f} ± {ef_s:.3f}")
-    print(f"  PAD      (↑)   : {pa_m:.2f} ± {pa_s:.2f} m  (higher = more proactive)")
-    print(f"  NPR      (↓)   : {np_m:.2f} ± {np_s:.2f}    (lower = less backtracking)")
+    print(f"  Distance       (↓) : {d_m:7.1f} ± {d_s:.1f} m")
+    print(f"  Speed          (↑) : {sp_m:.3f} ± {sp_s:.3f} m/s")
+    print(f"  Efficiency     (↑) : {ef_m:.3f} ± {ef_s:.3f}")
+    print(f"  PAD            (↑) : {pa_m:.2f} ± {pa_s:.2f} m  (higher = more proactive)")
+    print(f"  NPR            (↓) : {np_m:.2f} ± {np_s:.2f}    (lower = less backtracking)")
+    print(f"  Dead-end episodes  : {total_de} total across {len(results)} run(s)")
+    if not math.isnan(rr_m):
+        print(f"  Recovery rate  (↑) : {rr_m*100:.0f}% ± {rr_s*100:.0f}%  (episodes exited)")
+        print(f"  Mean exit time (↓) : {te_m:.1f} ± {te_s:.1f} s")
+    else:
+        print(f"  Recovery rate      : n/a (no dead-end episodes or no detector)")
     print(f"{'='*62}")
     print(f"\n  Table II row:")
     print(f"  {args.method:<22s}  {d_m:6.1f}  {sp_m:.3f}  {ef_m:.3f}  {pa_m:.1f}  {np_m:.2f}")
