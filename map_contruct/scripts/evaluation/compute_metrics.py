@@ -257,23 +257,29 @@ def compute_metrics(bag_path, de_min_duration_s=2.0, pad_lookahead_s=10.0,
             pad_values.append(0.0)
             continue
 
-        # Find the first large goal direction change in this window
-        turn_away_pos = None
-        prev_heading  = None
+        # Reference heading: direction the robot was heading just before the
+        # dead-end mouth (last goal in the window = "into dead end" direction).
+        # We compare every earlier goal against this reference rather than
+        # against the previous step.  This captures gradual EDE-guided avoidance
+        # where each individual step change is small (< 60°) but the cumulative
+        # deviation from the dead-end heading is large.
+        last_gts, last_gx, last_gy = window_goals[-1]
+        last_rpos   = robot_pos_at(last_gts)
+        dead_end_hdg = math.atan2(last_gy - last_rpos[1], last_gx - last_rpos[0])
 
-        for gts, gx, gy in window_goals:
+        turn_away_pos = None
+
+        for gts, gx, gy in window_goals[:-1]:   # search all goals except the last
             rpos = robot_pos_at(gts)
             hdg  = math.atan2(gy - rpos[1], gx - rpos[0])
-            if prev_heading is not None:
-                if _angle_diff(hdg, prev_heading) > turn_thresh_rad:
-                    turn_away_pos = rpos
-                    break
-            prev_heading = hdg
+            if _angle_diff(hdg, dead_end_hdg) > turn_thresh_rad:
+                turn_away_pos = rpos
+                break   # earliest point with sufficient deviation from dead-end
 
         if turn_away_pos is not None:
             pad_values.append(_dist(turn_away_pos, mouth_pos))
         else:
-            # No significant turn before dead-end (reactive planner)
+            # No significant deviation from dead-end heading — reactive planner
             pad_values.append(0.0)
 
     pad = float(np.mean(pad_values)) if pad_values else float('nan')
