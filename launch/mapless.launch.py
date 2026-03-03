@@ -11,6 +11,9 @@ Usage:
   ros2 launch map_contruct mapless.launch.py method:=nav2_dwb
   ros2 launch map_contruct mapless.launch.py method:=dram
 
+  # With automatic bag recording (for Table II metrics):
+  ros2 launch map_contruct mapless.launch.py method:=dram record:=true run_id:=1
+
 Methods:
   dwa       — DWA baseline    (goal_generator λ=0 + dwa_planner)
   mppi      — MPPI baseline   (goal_generator λ=0 + mppi_planner)
@@ -24,8 +27,11 @@ All methods share:
 NOTE: SLAM (e.g. slam_toolbox) must be launched separately to provide /map.
 """
 
+import datetime
+import os
+
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -42,6 +48,8 @@ METHOD_CONFIG = {
 def launch_setup(context, *args, **kwargs):
     method   = LaunchConfiguration('method').perform(context)
     use_rviz = LaunchConfiguration('use_rviz').perform(context).lower() == 'true'
+    record   = LaunchConfiguration('record').perform(context).lower() == 'true'
+    run_id   = LaunchConfiguration('run_id').perform(context)
 
     if method not in METHOD_CONFIG:
         raise ValueError(
@@ -51,6 +59,30 @@ def launch_setup(context, *args, **kwargs):
 
     cfg = METHOD_CONFIG[method]
     nodes = []
+
+    # ── Optional: automatic bag recording ───────────────────────────────────
+    if record:
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        bag_name  = f"run_{run_id}_{timestamp}" if run_id else f"run_{timestamp}"
+        bag_dir   = os.path.join('bags', method, bag_name)
+        os.makedirs(os.path.join('bags', method), exist_ok=True)
+
+        topics = [
+            '/odom',
+            '/odom_lidar',
+            '/move_base_simple/goal',
+            '/dead_end_detection/is_dead_end',
+            '/cmd_vel',
+            '/tf',
+        ]
+
+        nodes.append(ExecuteProcess(
+            cmd=['ros2', 'bag', 'record'] + topics + ['-o', bag_dir],
+            output='screen',
+            name='bag_recorder',
+        ))
+        print(f'\n[bag_recorder] Recording to: {bag_dir}\n'
+              f'[bag_recorder] Topics: {" ".join(topics)}\n')
 
     # ── Always: goal generator ───────────────────────────────────────────────
     nodes.append(Node(
@@ -138,6 +170,16 @@ def generate_launch_description():
             'use_rviz',
             default_value='false',
             description='Launch RViz for visualization: true | false'
+        ),
+        DeclareLaunchArgument(
+            'record',
+            default_value='false',
+            description='Auto-record a bag for Table II metrics: true | false'
+        ),
+        DeclareLaunchArgument(
+            'run_id',
+            default_value='',
+            description='Run label appended to bag name (e.g. 1, 2, 3 ...)'
         ),
         OpaqueFunction(function=launch_setup),
     ])
