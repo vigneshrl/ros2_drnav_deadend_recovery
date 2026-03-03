@@ -31,6 +31,9 @@ setup(
             # Goal Generator
             'goal_generator = map_contruct.goal_generator.goal_generator:main',
             
+            # Scripts - Control
+            'direct_vel_controller = map_contruct.scripts.control.direct_vel_controller:main',
+
             # Scripts - Inference
             'infer_vis = map_contruct.scripts.inference.infer_vis:main',
             
