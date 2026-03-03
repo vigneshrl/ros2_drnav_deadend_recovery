@@ -20,7 +20,7 @@ class Nav2DwbPlannerNode(Node):
         # Subscribers
         self.goal_sub = self.create_subscription(
             PoseStamped,
-            '/move_base_simple/goal',
+            'goal_pose',
             self.goal_callback,
             10
         )
