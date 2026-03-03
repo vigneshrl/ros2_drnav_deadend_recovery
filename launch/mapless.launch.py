@@ -73,6 +73,7 @@ def launch_setup(context, *args, **kwargs):
             '/odom_lidar',
             '/move_base_simple/goal',
             '/dead_end_detection/is_dead_end',
+            '/dead_end_detection/path_status',   # F/L/R scores — needed for detection latency
             '/cmd_vel',
             '/tf',
         ]
