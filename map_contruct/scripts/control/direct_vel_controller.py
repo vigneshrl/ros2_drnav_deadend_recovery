@@ -3,24 +3,26 @@
 Direct Velocity Controller for DR.Nav
 ======================================
 Converts infer_vis path scores (F, L, R) directly to cmd_vel,
-blended with goal-directed heading from /move_base_simple/goal.
+blended with goal-directed heading from /goal_pose.
 
 No waypoint generation or local planner needed.
-Goal is given via /move_base_simple/goal (e.g. RViz2 2D Nav Goal button).
+Goal is given via /goal_pose (RViz2 Nav2 Goal button).
 
 Behaviour
 ---------
   Normal   : desired_heading = blend(model_heading, goal_heading)
+             goal_weight=3.0 makes goal dominant over model's forward bias
              v   = max_v * confidence * cos(heading_error)
              ω   = Kp * heading_error
   Recovery : all paths below blocked_threshold → reverse + rotate toward goal
+           : OR stuck (< 0.05 m movement in 3 s) → same recovery action
   Reached  : dist to goal < goal_tol → stop and wait for next goal
 
 Topic I/O
 ---------
   Subscribes:
-    /dead_end_detection/path_status  Float32MultiArray  [F, L, R] from dram_risk_map
-    /move_base_simple/goal           PoseStamped        goal from RViz2
+    /dead_end_detection/path_status  Float32MultiArray  [F, L, R] from infer_vis
+    /goal_pose                       PoseStamped        goal from RViz2
   Publishes:
     /cmd_vel                         Twist
 """
@@ -31,6 +33,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist, PoseStamped
 from std_msgs.msg import Float32MultiArray
 from tf2_ros import TransformListener, Buffer
+from collections import deque
 
 
 class DirectVelController(Node):
@@ -38,14 +41,16 @@ class DirectVelController(Node):
         super().__init__('direct_vel_controller')
 
         # ── Tunable parameters ──────────────────────────────────────────────
-        self.max_v         = 0.4    # max forward speed (m/s)
-        self.max_omega     = 1.2    # max angular speed (rad/s)
-        self.Kp            = 1.5    # proportional heading gain
-        self.goal_weight   = 0.5    # how strongly goal direction pulls vs model
-        self.blocked_thr   = 0.35   # all paths below this → recovery mode
-        self.goal_tol      = 0.5    # distance (m) at which goal is "reached"
-        self.recovery_v    = -0.15  # reverse speed in recovery (m/s)
-        self.recovery_omega = 0.8   # rotation speed in recovery (rad/s)
+        self.max_v          = 0.4    # max forward speed (m/s)
+        self.max_omega      = 1.2    # max angular speed (rad/s)
+        self.Kp             = 1.5    # proportional heading gain
+        self.goal_weight    = 3.0    # goal pulls 6× stronger than model (was 0.5)
+        self.blocked_thr    = 0.35   # all paths below this → recovery mode
+        self.goal_tol       = 0.5    # distance (m) at which goal is "reached"
+        self.recovery_v     = -0.15  # reverse speed in recovery (m/s)
+        self.recovery_omega = 0.8    # rotation speed in recovery (rad/s)
+        self.stuck_window   = 30     # ticks at 10 Hz = 3 s to detect stuck
+        self.stuck_dist     = 0.05   # metres — movement below this = stuck
         # ────────────────────────────────────────────────────────────────────
 
         # State
@@ -54,6 +59,7 @@ class DirectVelController(Node):
         self.in_recovery       = False
         self.recovery_dir      = 1.0    # +1 left / -1 right rotation in recovery
         self.recovery_cooldown = 0      # callbacks before recovery can re-trigger
+        self.pos_history       = deque(maxlen=self.stuck_window)  # (x, y) ring buffer
 
         # TF
         self.tf_buffer   = Buffer()
@@ -90,6 +96,7 @@ class DirectVelController(Node):
         self.current_goal      = (msg.pose.position.x, msg.pose.position.y)
         self.in_recovery       = False
         self.recovery_cooldown = 0
+        self.pos_history.clear()
         self.get_logger().info(
             f'New goal: ({self.current_goal[0]:.2f}, {self.current_goal[1]:.2f})')
 
@@ -139,6 +146,9 @@ class DirectVelController(Node):
         goal_world_angle = math.atan2(gy - ry, gx - rx)
         goal_robot_angle = self._normalize(goal_world_angle - ryaw)
 
+        # Track position for stuck detection
+        self.pos_history.append((rx, ry))
+
         # Tick recovery cooldown
         if self.recovery_cooldown > 0:
             self.recovery_cooldown -= 1
@@ -152,6 +162,18 @@ class DirectVelController(Node):
         else:
             F, L, R = 0.5, 0.5, 0.5
             all_blocked = False
+
+        # Stuck detection: if we have a full window and haven't moved, force recovery
+        if (not self.in_recovery and self.recovery_cooldown == 0
+                and len(self.pos_history) == self.stuck_window):
+            xs = [p[0] for p in self.pos_history]
+            ys = [p[1] for p in self.pos_history]
+            spread = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+            if spread < self.stuck_dist:
+                all_blocked = True
+                self.get_logger().warn(
+                    f'Stuck detected: moved only {spread:.3f} m in '
+                    f'{self.stuck_window / 10:.0f} s — forcing recovery')
 
         if all_blocked and self.recovery_cooldown == 0:
             if not self.in_recovery:
