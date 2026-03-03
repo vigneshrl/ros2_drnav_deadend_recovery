@@ -80,6 +80,7 @@ WANTED_TOPICS = {
     '/move_base_simple/goal',
     '/dead_end_detection/is_dead_end',
     '/cmd_vel',
+    '/tf',
 }
 
 
@@ -122,7 +123,76 @@ def read_bag(bag_path):
 # ── data extraction ────────────────────────────────────────────────────────────
 
 def _poses(messages):
-    """Sorted list of (ts_ns, x, y) from /odom_lidar or /odom."""
+    """Sorted list of (ts_ns, x, y) in the MAP frame.
+
+    Goals are published in the map frame, so NPR and PAD are only meaningful
+    if robot poses are also in the map frame.
+
+    Strategy:
+      1. Reconstruct map→base_link by composing map→odom and odom→base_link
+         from the recorded /tf topic.
+      2. Fall back to /odom_lidar (odom frame) if TF data is absent.
+    """
+    # ── attempt TF reconstruction ────────────────────────────────────────────
+    tf_msgs = messages.get('/tf', [])
+    # Build lookup: (parent, child) → sorted list of (ts_ns, tx, ty, qz, qw)
+    tf_tree = defaultdict(list)
+    for ts, msg in tf_msgs:
+        for t in msg.transforms:
+            key = (t.header.frame_id, t.child_frame_id)
+            tx = t.transform.translation.x
+            ty = t.transform.translation.y
+            qz = t.transform.rotation.z
+            qw = t.transform.rotation.w
+            tf_tree[key].append((ts, tx, ty, qz, qw))
+    for key in tf_tree:
+        tf_tree[key].sort()
+
+    def _lookup_tf(key, ts_ns):
+        """Nearest-in-time TF lookup. Returns (tx, ty, qz, qw) or None."""
+        entries = tf_tree.get(key)
+        if not entries:
+            return None
+        idx = int(np.searchsorted([e[0] for e in entries], ts_ns))
+        idx = max(0, min(idx, len(entries) - 1))
+        _, tx, ty, qz, qw = entries[idx]
+        return tx, ty, qz, qw
+
+    def _compose(t1, t2):
+        """Compose two 2-D transforms (tx,ty,qz,qw) : T_result = T1 ∘ T2."""
+        tx1, ty1, qz1, qw1 = t1
+        tx2, ty2, qz2, qw2 = t2
+        # Rotate T2 translation by T1 heading
+        s1 = 2 * qw1 * qz1       # sin(yaw1)
+        c1 = 1 - 2 * qz1 * qz1   # cos(yaw1)
+        tx = tx1 + c1 * tx2 - s1 * ty2
+        ty = ty1 + s1 * tx2 + c1 * ty2
+        # Quaternion multiply (2-D: only z,w components)
+        qz = qw1 * qz2 + qz1 * qw2
+        qw = qw1 * qw2 - qz1 * qz2
+        return tx, ty, qz, qw
+
+    have_map_odom   = bool(tf_tree.get(('map',  'odom')))
+    have_odom_base  = bool(tf_tree.get(('odom', 'base_link')))
+    use_tf = have_map_odom and have_odom_base
+
+    if use_tf:
+        # Build poses in map frame via composed TF
+        odom_topic = '/odom_lidar' if '/odom_lidar' in messages else '/odom'
+        out = []
+        for ts, msg in messages.get(odom_topic, []):
+            # odom→base_link from the recorded /tf
+            t_ob = _lookup_tf(('odom', 'base_link'), ts)
+            t_mo = _lookup_tf(('map',  'odom'),       ts)
+            if t_ob is None or t_mo is None:
+                continue
+            tx, ty, _, _ = _compose(t_mo, t_ob)
+            out.append((ts, tx, ty))
+        if out:
+            return sorted(out)
+        # fall through if compose produced nothing
+
+    # ── fallback: use raw odom position ─────────────────────────────────────
     topic = '/odom_lidar' if '/odom_lidar' in messages else '/odom'
     out = []
     for ts, msg in messages.get(topic, []):
