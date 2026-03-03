@@ -79,6 +79,7 @@ WANTED_TOPICS = {
     '/odom_lidar',
     '/move_base_simple/goal',
     '/dead_end_detection/is_dead_end',
+    '/dead_end_detection/path_status',
     '/cmd_vel',
     '/tf',
 }
@@ -216,6 +217,100 @@ def _dead_end_flags(messages):
     for ts, msg in messages.get('/dead_end_detection/is_dead_end', []):
         out.append((ts, bool(msg.data)))
     return sorted(out)
+
+
+def _path_status(messages):
+    """Sorted list of (ts_ns, F, L, R) from /dead_end_detection/path_status."""
+    out = []
+    for ts, msg in messages.get('/dead_end_detection/path_status', []):
+        if len(msg.data) >= 3:
+            out.append((ts, float(msg.data[0]), float(msg.data[1]), float(msg.data[2])))
+    return sorted(out)
+
+
+def compute_detection_latency(messages, block_threshold=0.45, de_min_duration_s=2.0):
+    """
+    Detection latency: seconds from when path scores first ALL drop below
+    block_threshold to when is_dead_end first becomes True in that episode.
+
+    Also computes false-positive rate: fraction of 1-second open-space windows
+    (all path scores above threshold) where is_dead_end=True fires.
+
+    Returns (latencies_list, fp_rate, n_fp_windows, n_open_windows)
+    """
+    ps      = _path_status(messages)
+    de_flags = _dead_end_flags(messages)
+
+    if not ps or not de_flags:
+        return [], float('nan'), 0, 0
+
+    # Build is_dead_end lookup
+    de_ts_arr  = np.array([t for t, _ in de_flags])
+    de_val_arr = np.array([v for _, v in de_flags], dtype=bool)
+
+    def is_de_at(ts_ns):
+        idx = int(np.searchsorted(de_ts_arr, ts_ns))
+        idx = max(0, min(idx, len(de_ts_arr) - 1))
+        return bool(de_val_arr[idx])
+
+    # ── Detection latency ────────────────────────────────────────────────────
+    # Find contiguous blocks where all 3 scores < block_threshold
+    latencies = []
+    in_block  = False
+    block_start_ts = None
+
+    for ts, F, L, R in ps:
+        all_blocked = F < block_threshold and L < block_threshold and R < block_threshold
+        if all_blocked and not in_block:
+            in_block       = True
+            block_start_ts = ts
+        elif not all_blocked and in_block:
+            in_block = False
+            block_start_ts = None
+
+        if in_block and is_de_at(ts):
+            # First callback where both model says blocked AND is_dead_end=True
+            latency_s = (ts - block_start_ts) * 1e-9
+            if 0.0 < latency_s < 10.0:   # sanity filter
+                latencies.append(latency_s)
+            in_block = False
+            block_start_ts = None
+
+    # ── False-positive rate ──────────────────────────────────────────────────
+    # 1-second sliding windows where all scores > block_threshold (open space)
+    # Count how many such windows have is_dead_end=True at any point inside
+    window_ns    = int(1.0 * 1e9)
+    n_open       = 0
+    n_fp         = 0
+    ps_arr       = np.array([(t, F, L, R) for t, F, L, R in ps])
+
+    i = 0
+    while i < len(ps):
+        ts, F, L, R = ps[i]
+        if F > block_threshold and L > block_threshold and R > block_threshold:
+            # Open-space window: check the next 1 second
+            window_end = ts + window_ns
+            j = i
+            all_open_in_window = True
+            fp_in_window       = False
+            while j < len(ps) and ps[j][0] <= window_end:
+                wF, wL, wR = ps[j][1], ps[j][2], ps[j][3]
+                if wF < block_threshold or wL < block_threshold or wR < block_threshold:
+                    all_open_in_window = False
+                    break
+                if is_de_at(ps[j][0]):
+                    fp_in_window = True
+                j += 1
+            if all_open_in_window and j > i:
+                n_open += 1
+                if fp_in_window:
+                    n_fp += 1
+            i = j if j > i else i + 1
+        else:
+            i += 1
+
+    fp_rate = n_fp / n_open if n_open > 0 else float('nan')
+    return latencies, fp_rate, n_fp, n_open
 
 
 def _goal_at(goals, ts_ns):
@@ -414,10 +509,25 @@ def main():
                         help='Goal heading change in degrees to count as "turning away" (default 60)')
     args = parser.parse_args()
 
+    all_latencies = []
+    all_fp_rates  = []
+    all_open_wins = 0
+
     results = []
     for bag_path in args.bags:
         print(f"\nProcessing: {bag_path}")
         try:
+            # Detection latency + false-positive rate
+            messages_raw = read_bag(bag_path)
+            lats, fpr, n_fp, n_open = compute_detection_latency(messages_raw)
+            if lats:
+                all_latencies.extend(lats)
+                print(f"  detection latency per episode: {[f'{l:.2f}s' for l in lats]}")
+            if not math.isnan(fpr):
+                all_fp_rates.append(fpr)
+                all_open_wins += n_open
+                print(f"  false-positive rate: {fpr*100:.1f}%  ({n_fp}/{n_open} open windows)")
+
             r = compute_metrics(
                 bag_path,
                 de_min_duration_s=args.de_min_duration,
@@ -471,6 +581,17 @@ def main():
     print(f"{'='*62}")
     print(f"\n  Table II row:")
     print(f"  {args.method:<22s}  {d_m:6.1f}  {sp_m:.3f}  {ef_m:.3f}  {pa_m:.1f}  {np_m:.2f}")
+
+    # Section G values
+    if all_latencies:
+        lat_mean = float(np.mean(all_latencies))
+        lat_std  = float(np.std(all_latencies))
+        print(f"\n  [Sec G] Detection latency : {lat_mean:.2f} ± {lat_std:.2f} s  "
+              f"(over {len(all_latencies)} episode(s))")
+    if all_fp_rates:
+        fp_mean = float(np.mean(all_fp_rates)) * 100
+        print(f"  [Sec G] False-positive rate: {fp_mean:.1f}%  "
+              f"({all_open_wins} open-space windows total)")
     print()
 
 
