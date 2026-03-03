@@ -581,10 +581,9 @@ class GoalGenerator(Node):
         candidates = []
 
         # Minimum distance a recovery point must be from the robot.
-        # Points closer than this are useless — the DWA's 1 m goal-reached
-        # threshold means the robot never has to move to "reach" them, which
-        # causes the recovery→clear→re-trigger loop seen in the logs.
-        min_recovery_dist = 2.0
+        # Must be > 1.0 m (DWA/goal_generator "reached" threshold) so the robot
+        # actually has to move.  1.5 m gives 0.5 m of travel margin.
+        min_recovery_dist = 1.5
 
         # Use semantic recovery points from dram_risk_map if any are far enough
         if self.recovery_points:
@@ -594,18 +593,20 @@ class GoalGenerator(Node):
                     candidates.append((rp['x'], rp['y']))
 
         # Fall back to geometric candidates (works for all methods, and whenever
-        # the semantic points are all too close to the robot)
+        # the semantic points are all too close to the robot).
+        # Try progressively shorter distances so tight corridors still find a
+        # free cell rather than returning None and leaving the robot stuck.
         if not candidates:
-            recovery_distance = 2.0  # meters behind / to the sides
             recovery_angles = [math.pi, 3*math.pi/4, 5*math.pi/4, math.pi/2, -math.pi/2]
-
-            for angle_offset in recovery_angles:
-                candidate_heading = robot_yaw + angle_offset
-                candidate_x = robot_x + recovery_distance * math.cos(candidate_heading)
-                candidate_y = robot_y + recovery_distance * math.sin(candidate_heading)
-
-                if not self.is_point_occupied(candidate_x, candidate_y):
-                    candidates.append((candidate_x, candidate_y))
+            for recovery_distance in [2.0, 1.5, 1.2]:
+                for angle_offset in recovery_angles:
+                    candidate_heading = robot_yaw + angle_offset
+                    candidate_x = robot_x + recovery_distance * math.cos(candidate_heading)
+                    candidate_y = robot_y + recovery_distance * math.sin(candidate_heading)
+                    if not self.is_point_occupied(candidate_x, candidate_y):
+                        candidates.append((candidate_x, candidate_y))
+                if candidates:
+                    break  # found free cells at this distance, no need to try shorter
         
         if not candidates:
             return None
@@ -688,6 +689,8 @@ class GoalGenerator(Node):
             if waypoint:
                 self.active_recovery_waypoint = waypoint  # latch fixed world coords
                 self.get_logger().info(f'🚨 Recovery latched: heading to ({waypoint[0]:.1f}, {waypoint[1]:.1f})')
+            else:
+                self.get_logger().warn('⚠️ Recovery triggered but no free candidate found — all cells occupied!')
 
         if waypoint is None:
             # Normal exploration: sample headings, pick argmin θ*
