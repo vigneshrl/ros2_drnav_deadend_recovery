@@ -55,12 +55,12 @@ def launch_setup(context, *args, **kwargs):
     nodes = []
 
     # ── Always: odom → base_link TF ─────────────────────────────────────────
-    nodes.append(Node(
-        package='map_contruct',
-        executable='odom_tf_broadcaster',
-        name='odom_tf_broadcaster',
-        output='screen',
-    ))
+    # nodes.append(Node(
+    #     package='map_contruct',
+    #     executable='odom_tf_broadcaster',
+    #     name='odom_tf_broadcaster',
+    #     output='screen',
+    # ))
 
     # ── Optional: bag recording ──────────────────────────────────────────────
     if record:

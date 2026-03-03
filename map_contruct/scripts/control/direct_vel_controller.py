@@ -66,7 +66,7 @@ class DirectVelController(Node):
             self._path_status_cb, 10)
         self.create_subscription(
             PoseStamped,
-            '/move_base_simple/goal',
+            '/goal_pose',
             self._goal_cb, 10)
 
         # Publisher
