@@ -121,7 +121,11 @@ class GoalGenerator(Node):
         self.current_path_status = None
 
         #change the threshold for indoor as the detection is poor with the glasses
-        self.path_blocked_threshold = 0.56    # threshold for considering path blocked
+        # sigmoid(0) = 0.5 = model uncertainty/neutral.  Only fire recovery when
+        # the model is CONFIDENTLY saying a path is blocked (well below 0.5).
+        # 0.56 was triggering on every callback because model outputs ~0.5 for
+        # uncertain scenes, making is_truly_blocked permanently True.
+        self.path_blocked_threshold = 0.35    # threshold for considering path blocked
         self.is_truly_blocked = False         # all 3 directions blocked
 
         # Latched recovery waypoint (world-frame, set once, cleared when reached)
