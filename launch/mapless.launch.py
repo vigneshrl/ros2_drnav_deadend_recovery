@@ -48,8 +48,9 @@ METHOD_CONFIG = {
 def launch_setup(context, *args, **kwargs):
     method   = LaunchConfiguration('method').perform(context)
     use_rviz = LaunchConfiguration('use_rviz').perform(context).lower() == 'true'
-    record   = LaunchConfiguration('record').perform(context).lower() == 'true'
-    run_id   = LaunchConfiguration('run_id').perform(context)
+    record     = LaunchConfiguration('record').perform(context).lower() == 'true'
+    run_id     = LaunchConfiguration('run_id').perform(context)
+    model_path = LaunchConfiguration('model_path').perform(context)
 
     if method not in METHOD_CONFIG:
         raise ValueError(
@@ -114,6 +115,7 @@ def launch_setup(context, *args, **kwargs):
             parameters=[{
                 'robot_mode':          True,   # optimised for real-time
                 'save_visualizations': False,  # disable heavy disk writes
+                'model_path':          model_path,
             }]
         ))
         nodes.append(Node(
@@ -180,6 +182,11 @@ def generate_launch_description():
             'run_id',
             default_value='',
             description='Run label appended to bag name (e.g. 1, 2, 3 ...)'
+        ),
+        DeclareLaunchArgument(
+            'model_path',
+            default_value='',
+            description='Absolute path to model weights .pth file (required for DRAM)'
         ),
         OpaqueFunction(function=launch_setup),
     ])
