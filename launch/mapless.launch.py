@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
 """
-Mapless Navigation Launch File
-===============================
-Runs all methods in a mapless environment (no pre-built map).
-SLAM must be running separately to provide /map (e.g. slam_toolbox).
+Mapless Navigation Launch File  —  v1.0.0
+==========================================
+Clean architecture: each method is self-contained.
+Goal is given via RViz2 2D Nav Goal button (publishes to /move_base_simple/goal).
+SLAM must be running separately to provide /map and the map→odom TF.
 
-Usage:
+Usage
+-----
   ros2 launch map_contruct mapless.launch.py method:=dwa
   ros2 launch map_contruct mapless.launch.py method:=mppi
   ros2 launch map_contruct mapless.launch.py method:=nav2_dwb
-  ros2 launch map_contruct mapless.launch.py method:=dram
+  ros2 launch map_contruct mapless.launch.py method:=dram model_path:=/path/to/model_best.pth
 
-  # With automatic bag recording (for Table II metrics):
-  ros2 launch map_contruct mapless.launch.py method:=dram record:=true run_id:=1
+  # With bag recording:
+  ros2 launch map_contruct mapless.launch.py method:=dram \\
+      model_path:=/path/to/model_best.pth record:=true run_id:=1
 
-Methods:
-  dwa       — DWA baseline    (goal_generator λ=0 + dwa_planner)
-  mppi      — MPPI baseline   (goal_generator λ=0 + mppi_planner)
-  nav2_dwb  — Nav2 DWB baseline (goal_generator λ=0 + nav2_dwb_planner)
-  dram      — DR.Nav full method (infer_vis + dram_risk_map + goal_generator λ=1 + dwa_planner)
+Methods
+-------
+  dwa       — DWA local planner  (subscribes to /move_base_simple/goal + /map)
+  mppi      — MPPI local planner (subscribes to /move_base_simple/goal + /map)
+  nav2_dwb  — Nav2 DWB planner   (subscribes to /move_base_simple/goal + /map)
+  dram      — DR.Nav: infer_vis + dram_risk_map + direct_vel_controller
+                      (goal from RViz2, model drives velocity directly)
 
 All methods share:
-  - odom_tf_broadcaster  : publishes odom -> body TF from /odom_lidar
-  - goal_generator       : selects waypoints using unified scoring
+  - odom_tf_broadcaster : publishes odom→base_link TF from /odom_lidar
 
-NOTE: SLAM (e.g. slam_toolbox) must be launched separately to provide /map.
+NOTE: SLAM (e.g. slam_toolbox) must be launched separately.
+NOTE: Give the robot a goal in RViz2 using the 2D Nav Goal button.
 """
 
 import datetime
@@ -36,32 +41,28 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
-# ─── method → goal_generator config ────────────────────────────────────────
-METHOD_CONFIG = {
-    'dwa':      {'method_type': 'dwa_lidar',          'lambda_ede': 0.0},
-    'mppi':     {'method_type': 'mppi_lidar',          'lambda_ede': 0.0},
-    'nav2_dwb': {'method_type': 'nav2_dwb_lidar',      'lambda_ede': 0.0},
-    'dram':     {'method_type': 'multi_camera_dram',   'lambda_ede': 1.0},
-}
-
-
 def launch_setup(context, *args, **kwargs):
-    method   = LaunchConfiguration('method').perform(context)
-    use_rviz = LaunchConfiguration('use_rviz').perform(context).lower() == 'true'
+    method     = LaunchConfiguration('method').perform(context)
+    use_rviz   = LaunchConfiguration('use_rviz').perform(context).lower() == 'true'
     record     = LaunchConfiguration('record').perform(context).lower() == 'true'
     run_id     = LaunchConfiguration('run_id').perform(context)
     model_path = LaunchConfiguration('model_path').perform(context)
 
-    if method not in METHOD_CONFIG:
-        raise ValueError(
-            f"Unknown method '{method}'. "
-            f"Choose from: {list(METHOD_CONFIG.keys())}"
-        )
+    valid = ('dwa', 'mppi', 'nav2_dwb', 'dram')
+    if method not in valid:
+        raise ValueError(f"Unknown method '{method}'. Choose from: {list(valid)}")
 
-    cfg = METHOD_CONFIG[method]
     nodes = []
 
-    # ── Optional: automatic bag recording ───────────────────────────────────
+    # ── Always: odom → base_link TF ─────────────────────────────────────────
+    nodes.append(Node(
+        package='map_contruct',
+        executable='odom_tf_broadcaster',
+        name='odom_tf_broadcaster',
+        output='screen',
+    ))
+
+    # ── Optional: bag recording ──────────────────────────────────────────────
     if record:
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         bag_name  = f"run_{run_id}_{timestamp}" if run_id else f"run_{timestamp}"
@@ -73,35 +74,52 @@ def launch_setup(context, *args, **kwargs):
             '/odom_lidar',
             '/move_base_simple/goal',
             '/dead_end_detection/is_dead_end',
-            '/dead_end_detection/path_status',   # F/L/R scores — needed for detection latency
+            '/dead_end_detection/path_status',
             '/cmd_vel',
             '/tf',
         ]
-
         nodes.append(ExecuteProcess(
             cmd=['ros2', 'bag', 'record'] + topics + ['-o', bag_dir],
             output='screen',
             name='bag_recorder',
         ))
-        print(f'\n[bag_recorder] Recording to: {bag_dir}\n'
-              f'[bag_recorder] Topics: {" ".join(topics)}\n')
+        print(f'\n[bag_recorder] Recording to: {bag_dir}')
+        print(f'[bag_recorder] Topics: {" ".join(topics)}\n')
 
-    # ── Always: goal generator ───────────────────────────────────────────────
-    nodes.append(Node(
-        package='map_contruct',
-        executable='goal_generator',
-        name='goal_generator',
-        output='screen',
-        parameters=[{
-            'method_type':           cfg['method_type'],
-            'lambda_ede':            cfg['lambda_ede'],
-            'goal_generation_rate':  7.0,
-            'horizon_distance':      4.0,
-        }]
-    ))
+    # ── Method: baselines ────────────────────────────────────────────────────
+    # Each baseline subscribes to /move_base_simple/goal (set via RViz2)
+    # and /map (from SLAM). No goal_generator needed.
 
-    # ── Method-specific: perception stack (DRAM only) ────────────────────────
-    if method == 'dram':
+    if method == 'dwa':
+        nodes.append(Node(
+            package='map_contruct',
+            executable='dwa_planner',
+            name='dwa_planner',
+            output='screen',
+        ))
+
+    elif method == 'mppi':
+        nodes.append(Node(
+            package='map_contruct',
+            executable='mppi_planner',
+            name='mppi_planner',
+            output='screen',
+        ))
+
+    elif method == 'nav2_dwb':
+        nodes.append(Node(
+            package='map_contruct',
+            executable='nav2_dwb_planner',
+            name='nav2_dwb_planner',
+            output='screen',
+        ))
+
+    # ── Method: DR.Nav ───────────────────────────────────────────────────────
+    # Perception stack: pointcloud_segmenter → infer_vis → dram_risk_map
+    # Control:          direct_vel_controller (F/L/R scores → cmd_vel directly)
+    # Goal:             from RViz2 /move_base_simple/goal
+
+    elif method == 'dram':
         nodes.append(Node(
             package='map_contruct',
             executable='pointcloud_segmenter',
@@ -114,10 +132,10 @@ def launch_setup(context, *args, **kwargs):
             name='infer_vis',
             output='screen',
             parameters=[{
-                'robot_mode':          True,   # optimised for real-time
-                'save_visualizations': False,  # disable heavy disk writes
+                'robot_mode':          True,
+                'save_visualizations': False,
                 'model_path':          model_path,
-            }]
+            }],
         ))
         nodes.append(Node(
             package='map_contruct',
@@ -125,32 +143,14 @@ def launch_setup(context, *args, **kwargs):
             name='dram_risk_map',
             output='screen',
         ))
-
-    # ── Method-specific: local planner ───────────────────────────────────────
-    if method in ('dwa', 'dram'):
-        # DRAM uses DWA as its local controller
         nodes.append(Node(
             package='map_contruct',
-            executable='dwa_planner',
-            name='dwa_planner',
-            output='screen',
-        ))
-    elif method == 'mppi':
-        nodes.append(Node(
-            package='map_contruct',
-            executable='mppi_planner',
-            name='mppi_planner',
-            output='screen',
-        ))
-    elif method == 'nav2_dwb':
-        nodes.append(Node(
-            package='map_contruct',
-            executable='nav2_dwb_planner',
-            name='nav2_dwb_planner',
+            executable='direct_vel_controller',
+            name='direct_vel_controller',
             output='screen',
         ))
 
-    # ── Optional: RViz ───────────────────────────────────────────────────────
+    # ── Optional: RViz ──────────────────────────────────────────────────────
     if use_rviz:
         nodes.append(Node(
             package='rviz2',
@@ -167,27 +167,27 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'method',
             default_value='dwa',
-            description='Navigation method: dwa | mppi | nav2_dwb | dram'
+            description='Navigation method: dwa | mppi | nav2_dwb | dram',
         ),
         DeclareLaunchArgument(
             'use_rviz',
             default_value='false',
-            description='Launch RViz for visualization: true | false'
+            description='Launch RViz for visualization: true | false',
         ),
         DeclareLaunchArgument(
             'record',
             default_value='false',
-            description='Auto-record a bag for Table II metrics: true | false'
+            description='Auto-record a bag: true | false',
         ),
         DeclareLaunchArgument(
             'run_id',
             default_value='',
-            description='Run label appended to bag name (e.g. 1, 2, 3 ...)'
+            description='Run label appended to bag name (e.g. 1, 2, 3)',
         ),
         DeclareLaunchArgument(
             'model_path',
             default_value='',
-            description='Absolute path to model weights .pth file (required for DRAM)'
+            description='Absolute path to model weights .pth file (required for dram)',
         ),
         OpaqueFunction(function=launch_setup),
     ])
