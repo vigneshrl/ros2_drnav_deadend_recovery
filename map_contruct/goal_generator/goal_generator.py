@@ -29,6 +29,7 @@ import math
 import time
 from typing import List, Tuple, Optional, Dict
 import tf2_geometry_msgs
+from scipy.ndimage import binary_dilation
 
 class GoalGenerator(Node):
     def __init__(self):
@@ -109,6 +110,7 @@ class GoalGenerator(Node):
         self.last_robot_yaw = 0.0
         self.risk_grid = {}                   # (x, y) -> risk_value [0,1]
         self.occupancy_grid = None
+        self.inflated_mask = None             # binary_dilation of occupancy grid
         self.recovery_points = []
         self.consecutive_dead_ends = 0
         self.recovery_threshold = 4           # consecutive dead-ends before recovery
@@ -170,8 +172,25 @@ class GoalGenerator(Node):
                         self.risk_grid[(grid_x, grid_y)] = risk_value
 
     def occupancy_map_callback(self, msg: OccupancyGrid):
-        """Store occupancy grid for obstacle checking"""
+        """Store occupancy grid and rebuild inflated mask."""
         self.occupancy_grid = msg
+        self._rebuild_inflated_grid()
+
+    def _rebuild_inflated_grid(self):
+        """Dilate every occupied cell by inflation_radius — same as local planners.
+
+        This ensures goal_generator only marks a ray as feasible when the local
+        planner can also navigate it.  Previously goal_generator used raw map
+        lookups while planners used a dilated map, so goals were placed through
+        corridors that were geometrically impassable, causing all methods to
+        behave identically (all drove into the same wall).
+        """
+        info = self.occupancy_grid.info
+        raw = np.array(self.occupancy_grid.data, dtype=np.int8).reshape(
+            (info.height, info.width))
+        occupied = raw > 50
+        cells = int(math.ceil(self.inflation_radius / info.resolution))
+        self.inflated_mask = binary_dilation(occupied, iterations=cells)
 
     def recovery_points_callback(self, msg: Float32MultiArray):
         """Store recovery points"""
@@ -300,7 +319,20 @@ class GoalGenerator(Node):
         return float(occupancy)  # [0-100]
 
     def is_point_occupied(self, x: float, y: float) -> bool:
-        """Check if point is occupied (for feasibility check)"""
+        """Return True if the inflated map marks (x, y) as no-go.
+
+        Uses the same binary-dilated mask as the local planners so that
+        goal_generator and the planner agree on what is navigable.
+        Falls back to raw map check if the mask is not yet available.
+        """
+        if self.inflated_mask is not None and self.occupancy_grid is not None:
+            info = self.occupancy_grid.info
+            gx = int((x - info.origin.position.x) / info.resolution)
+            gy = int((y - info.origin.position.y) / info.resolution)
+            if gx < 0 or gx >= info.width or gy < 0 or gy >= info.height:
+                return True
+            return bool(self.inflated_mask[gy, gx])
+        # Fallback before first map arrives
         return self.get_costmap_value(x, y) > 50.0
 
     def get_clearance_cost(self, x: float, y: float) -> float:
