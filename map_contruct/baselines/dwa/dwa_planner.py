@@ -48,6 +48,7 @@ from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import OccupancyGrid, Path
 from sensor_msgs.msg import LaserScan
 from tf2_ros import TransformListener, Buffer
+import tf2_geometry_msgs  # noqa: F401 — registers PoseStamped transform support
 from scipy.ndimage import binary_dilation
 
 
@@ -64,9 +65,10 @@ class DwaPlannerNode(Node):
         self.robot_radius       = 0.5    # [m] for collision check
         self.dt                 = 0.1     # [s] control timestep
         self.predict_time       = 2.0     # [s] trajectory simulation horizon
-        # DWA scoring gains
+        # DWA scoring gains (reference values — to_goal_gain deliberately small
+        # so obstacle avoidance is not overwhelmed by heading error)
         self.to_goal_gain       = 1.5     # heading-error cost weight
-        self.speed_gain         = 1.0     # higher → robot strongly prefers moving
+        self.speed_gain         = 2.0     # reward forward speed
         self.obstacle_gain      = 1.0     # obstacle cost weight
         self.robot_stuck_flag   = 0.001   # minimum v/omega to prevent freeze
         # Velocity sampling resolution inside dynamic window
@@ -126,10 +128,10 @@ class DwaPlannerNode(Node):
     #     self.global_path = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
 
     def _goal_cb(self, msg: PoseStamped):
-        self.current_goal = (msg.pose.position.x, msg.pose.position.y)
-        self.current_v    = 0.0
+        self.current_goal  = (msg.pose.position.x, msg.pose.position.y)
+        self.current_v     = 0.0
         self.current_omega = 0.0
-        self.get_logger().info(f'Goal: ({self.current_goal[0]:.2f}, {self.current_goal[1]:.2f})')
+        self.get_logger().info(f'Goal (map): ({self.current_goal[0]:.2f}, {self.current_goal[1]:.2f})')
 
     def _map_cb(self, msg: OccupancyGrid):
         self.occupancy_grid = msg

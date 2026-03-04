@@ -32,6 +32,7 @@ from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid, Path
 from geometry_msgs.msg import PoseStamped
 from tf2_ros import TransformListener, Buffer
+import tf2_geometry_msgs  # noqa: F401
 from scipy.ndimage import binary_dilation
 
 
@@ -78,11 +79,18 @@ class GlobalPlanner(Node):
             self._replan()
 
     def _goal_cb(self, msg: PoseStamped):
+        if msg.header.frame_id != 'map':
+            try:
+                msg = self.tf_buffer.transform(
+                    msg, 'map', timeout=rclpy.duration.Duration(seconds=0.5))
+            except Exception as e:
+                self.get_logger().error(f'Goal TF to map failed: {e}')
+                return
         self.current_goal = msg
         self.global_path  = []
         self.get_logger().info(
             f'New goal received: ({msg.pose.position.x:.2f}, {msg.pose.position.y:.2f}) '
-            f'[{msg.header.frame_id}]')
+            f'[map]')
         self._replan()
 
     # ── Map helpers ───────────────────────────────────────────────────────────

@@ -34,6 +34,7 @@ from nav_msgs.msg import OccupancyGrid, Path
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32MultiArray
 from tf2_ros import TransformListener, Buffer
+import tf2_geometry_msgs  # noqa: F401
 
 
 class DrNavDWAController(Node):

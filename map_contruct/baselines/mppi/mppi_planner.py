@@ -45,6 +45,7 @@ from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import OccupancyGrid, Path
 from sensor_msgs.msg import LaserScan
 from tf2_ros import TransformListener, Buffer
+import tf2_geometry_msgs  # noqa: F401
 from scipy.ndimage import binary_dilation
 
 
@@ -122,7 +123,7 @@ class MppiPlannerNode(Node):
     def _goal_cb(self, msg: PoseStamped):
         self.current_goal = (msg.pose.position.x, msg.pose.position.y)
         self.control_sequence = np.zeros((self.horizon, 2))
-        self.get_logger().info(f'Goal: ({self.current_goal[0]:.2f}, {self.current_goal[1]:.2f})')
+        self.get_logger().info(f'Goal (map): ({self.current_goal[0]:.2f}, {self.current_goal[1]:.2f})')
 
     def _map_cb(self, msg: OccupancyGrid):
         self.occupancy_grid = msg
