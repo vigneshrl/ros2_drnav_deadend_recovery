@@ -61,7 +61,7 @@ class DwaPlannerNode(Node):
         self.min_speed          = 0.0     # [m/s]  allow stop/rotate-in-place
         self.max_omega          = 1.0     # [rad/s]
         self.max_accel          = 0.5     # [m/s²]  higher → faster ramp-up
-        self.max_delta_yaw      = 1.0     # [rad/s²]
+        self.max_delta_yaw      = 10.0    # [rad/s²] — effectively unconstrained so full omega available immediately
         self.robot_radius       = 0.5    # [m] for collision check
         self.dt                 = 0.1     # [s] control timestep
         self.predict_time       = 2.0     # [s] trajectory simulation horizon
@@ -359,16 +359,24 @@ class DwaPlannerNode(Node):
                         min_r = d
                 continue
 
-            # Future states: hard collision check
-            if moving and self._is_occupied(x, y):
-                return float('inf')
-
-            for ox, oy in obstacle_pts:
-                d = math.hypot(x - ox, y - oy)
-                if d < self.robot_radius + 0.1:   # +0.1 m safety clearance
+            if moving:
+                # Moving state: hard collision check
+                if self._is_occupied(x, y):
                     return float('inf')
-                if d < min_r:
-                    min_r = d
+                for ox, oy in obstacle_pts:
+                    d = math.hypot(x - ox, y - oy)
+                    if d < self.robot_radius + 0.1:   # +0.1 m safety clearance
+                        return float('inf')
+                    if d < min_r:
+                        min_r = d
+            else:
+                # v=0 (spinning in place): robot doesn't move, no new collision risk.
+                # Only track min_r for continuous cost — do NOT hard-reject because
+                # robot is already at this position (close to wall is expected).
+                for ox, oy in obstacle_pts:
+                    d = math.hypot(x - ox, y - oy)
+                    if d < min_r:
+                        min_r = d
 
         return 1.0 / min_r
 
