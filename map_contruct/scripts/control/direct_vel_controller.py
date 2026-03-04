@@ -12,8 +12,10 @@ Behaviour
 ---------
   Normal   : desired_heading = blend(model_heading, goal_heading)
              goal_weight=3.0 makes goal dominant over model's forward bias
-             v   = max_v * confidence * cos(heading_error)
+             speed scaled by LiDAR proximity (slows 0.8 m, stops 0.4 m)
+             v   = max_v * confidence * prox_scale * cos(heading_error)
              ω   = Kp * heading_error
+  Proximity: front LiDAR min-dist < prox_stop_dist → zero forward, rotate to goal
   Recovery : all paths below blocked_threshold → reverse + rotate toward goal
            : OR stuck (< 0.05 m movement in 3 s) → same recovery action
   Reached  : dist to goal < goal_tol → stop and wait for next goal
@@ -22,15 +24,18 @@ Topic I/O
 ---------
   Subscribes:
     /dead_end_detection/path_status  Float32MultiArray  [F, L, R] from infer_vis
+    /lidar/front/points              PointCloud2        front sector from pointcloud_segmenter
     /goal_pose                       PoseStamped        goal from RViz2
   Publishes:
     /cmd_vel                         Twist
 """
 
 import math
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, PoseStamped
+from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Float32MultiArray
 from tf2_ros import TransformListener, Buffer
 from collections import deque
@@ -51,6 +56,8 @@ class DirectVelController(Node):
         self.recovery_omega = 0.8    # rotation speed in recovery (rad/s)
         self.stuck_window   = 30     # ticks at 10 Hz = 3 s to detect stuck
         self.stuck_dist     = 0.05   # metres — movement below this = stuck
+        self.prox_stop_dist = 0.4    # metres — hard stop forward motion
+        self.prox_slow_dist = 0.8    # metres — begin slowing down
         # ────────────────────────────────────────────────────────────────────
 
         # State
@@ -60,6 +67,7 @@ class DirectVelController(Node):
         self.recovery_dir      = 1.0    # +1 left / -1 right rotation in recovery
         self.recovery_cooldown = 0      # callbacks before recovery can re-trigger
         self.pos_history       = deque(maxlen=self.stuck_window)  # (x, y) ring buffer
+        self.front_min_dist    = 999.0  # latest min distance from front LiDAR (metres)
 
         # TF
         self.tf_buffer   = Buffer()
@@ -70,6 +78,10 @@ class DirectVelController(Node):
             Float32MultiArray,
             '/dead_end_detection/path_status',
             self._path_status_cb, 10)
+        self.create_subscription(
+            PointCloud2,
+            '/lidar/front/points',
+            self._front_lidar_cb, 10)
         self.create_subscription(
             PoseStamped,
             '/goal_pose',
@@ -91,6 +103,25 @@ class DirectVelController(Node):
             self.path_status = [float(msg.data[0]),
                                 float(msg.data[1]),
                                 float(msg.data[2])]
+
+    def _front_lidar_cb(self, msg: PointCloud2):
+        """Compute minimum horizontal distance from front PointCloud2."""
+        try:
+            n = msg.width * msg.height
+            if n == 0:
+                return
+            raw = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(n, msg.point_step)
+            x = raw[:, 0:4].copy().view(np.float32).flatten()
+            y = raw[:, 4:8].copy().view(np.float32).flatten()
+            z = raw[:, 8:12].copy().view(np.float32).flatten()
+            # Ignore ground (z < -0.1 m) and ceiling returns
+            valid = np.isfinite(x) & np.isfinite(y) & (z > -0.1) & (z < 1.5)
+            if not valid.any():
+                self.front_min_dist = 999.0
+                return
+            self.front_min_dist = float(np.min(np.sqrt(x[valid]**2 + y[valid]**2)))
+        except Exception:
+            self.front_min_dist = 999.0
 
     def _goal_cb(self, msg):
         self.current_goal      = (msg.pose.position.x, msg.pose.position.y)
@@ -194,6 +225,13 @@ class DirectVelController(Node):
             self.recovery_cooldown = 15   # 1.5 s cooldown at 10 Hz
             self.get_logger().info('Recovery complete, resuming normal navigation')
 
+        # ── LiDAR proximity: hard stop forward if wall too close ──────────
+        if self.front_min_dist < self.prox_stop_dist:
+            cmd.angular.z = float(max(-self.max_omega,
+                                      min(self.max_omega, self.Kp * goal_robot_angle)))
+            self.cmd_pub.publish(cmd)
+            return
+
         # ── Normal navigation: blend model + goal ─────────────────────────
         #
         # Model heading vector (robot frame):
@@ -222,8 +260,13 @@ class DirectVelController(Node):
         heading_error = self._normalize(desired_heading)
         confidence    = max(F, L, R)
 
+        # Proximity scale: 1.0 when clear, ramps to 0.0 at prox_stop_dist
+        prox_scale = min(1.0, max(0.0,
+            (self.front_min_dist - self.prox_stop_dist) /
+            (self.prox_slow_dist - self.prox_stop_dist)))
+
         # Forward speed: full when aligned, tapers to zero at 90°
-        v     = self.max_v * confidence * max(0.0, math.cos(heading_error))
+        v     = self.max_v * confidence * prox_scale * max(0.0, math.cos(heading_error))
         omega = float(max(-self.max_omega,
                           min(self.max_omega, self.Kp * heading_error)))
 
