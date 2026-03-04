@@ -49,8 +49,8 @@ class DrNavDWAController(Node):
         self.max_delta_yaw    = 1.0
         self.dt               = 0.1
         self.predict_time     = 2.0
-        self.v_resolution     = 0.05
-        self.omega_resolution = 0.1
+        self.v_samples        = 6
+        self.omega_samples    = 15
 
         # DWA cost weights
         self.w_heading  = 0.15   # heading alignment to carrot
@@ -76,7 +76,9 @@ class DrNavDWAController(Node):
         self.stuck_ref_pos     = None
 
         # ── State ─────────────────────────────────────────────────────────────
-        self.nav_state           = 'navigating'  # 'navigating' | 'recovering'
+        self.nav_state           = 'navigating'  # 'navigating' | 'recovering' | 'halted'
+        self.halt_ticks          = 0             # countdown timer when halted at recovery point
+        self.halt_duration_ticks = 30            # 30 × 0.1 s = 3 s observation pause
         self.consecutive_blocked = 0
         self.current_goal        = None
         self.original_goal       = None
@@ -124,6 +126,7 @@ class DrNavDWAController(Node):
         self.nav_state           = 'navigating'
         self.consecutive_blocked = 0
         self.dead_end_yaw        = None
+        self.halt_ticks          = 0
         self.stuck_count         = 0
         self.stuck_tick          = 0
         self.stuck_ref_pos       = None
@@ -176,16 +179,27 @@ class DrNavDWAController(Node):
         gx, gy = self.current_goal
         dist_to_goal = math.hypot(gx - rx, gy - ry)
 
-        # Goal / recovery point reached
-        if dist_to_goal < self.goal_tol:
-            if self.nav_state == 'recovering':
-                self.get_logger().info(
-                    'Reached recovery point. Resuming toward original goal.')
+        # Halted at recovery point — observe for halt_duration_ticks then resume
+        if self.nav_state == 'halted':
+            self.cmd_pub.publish(Twist())
+            self.halt_ticks -= 1
+            if self.halt_ticks <= 0:
+                self.get_logger().info('Halt complete. Resuming toward original goal.')
                 self.current_goal        = self.original_goal
                 self.original_goal       = None
                 self.nav_state           = 'navigating'
                 self.consecutive_blocked = 0
-                # dead_end_yaw persists → penalisation continues
+                # dead_end_yaw persists → direction penalisation continues
+            return
+
+        # Goal / recovery point reached
+        if dist_to_goal < self.goal_tol:
+            if self.nav_state == 'recovering':
+                self.get_logger().info(
+                    'Reached recovery point. Halting to observe surroundings.')
+                self.nav_state  = 'halted'
+                self.halt_ticks = self.halt_duration_ticks
+                # dead_end_yaw persists → penalisation active during halt and after
             else:
                 self.get_logger().info('Goal reached.')
                 self.current_goal = None
@@ -263,48 +277,65 @@ class DrNavDWAController(Node):
         om_min = max(-self.max_omega, self.current_omega - self.max_delta_yaw * self.dt)
         om_max = min(self.max_omega,  self.current_omega + self.max_delta_yaw * self.dt)
 
-        best_cost         = float('inf')
-        best_v, best_omega = 0.0, 0.0
-
-        v_steps  = max(1, int(round((v_max  - v_min)  / self.v_resolution)))
-        om_steps = max(1, int(round((om_max - om_min) / self.omega_resolution)))
-
-        for iv in range(v_steps + 1):
-            v = v_min + iv * (v_max - v_min) / v_steps
-            for iw in range(om_steps + 1):
-                omega = om_min + iw * (om_max - om_min) / om_steps
-                traj  = self._predict(rx, ry, ryaw, v, omega)
+        # ── 1. Sample and collect all valid trajectories ──────────────────────
+        trajectories = []
+        for v in np.linspace(v_min, v_max, self.v_samples):
+            for omega in np.linspace(om_min, om_max, self.omega_samples):
+                traj = self._predict(rx, ry, ryaw, v, omega)
                 if traj is None:
+                    continue
+
+                obs_cost = self._obstacle_cost(traj)
+                if obs_cost >= 1.0:          # fully blocked — skip
                     continue
 
                 goal_cost    = self._heading_cost(traj, carrot)
                 to_goal_cost = self._to_goal_cost(traj, carrot)
-                obs_cost     = self._obstacle_cost(traj)
                 speed_cost   = self.max_speed - traj[-1, 3]
 
-                # Penalise trajectories heading back toward the dead-end direction
+                # Dead-end direction penalty (already bounded in [0, penalty_w])
                 penalty = 0.0
                 if self.dead_end_yaw is not None:
-                    final_heading = traj[-1, 2]
                     delta = math.atan2(
-                        math.sin(final_heading - self.dead_end_yaw),
-                        math.cos(final_heading - self.dead_end_yaw))
+                        math.sin(traj[-1, 2] - self.dead_end_yaw),
+                        math.cos(traj[-1, 2] - self.dead_end_yaw))
                     penalty = self.penalty_w * max(0.0, math.cos(delta))
 
-                cost = (self.w_heading * goal_cost    +
-                        self.w_to_goal * to_goal_cost +
-                        self.w_dist   * obs_cost      +
-                        self.w_vel    * speed_cost    +
-                        penalty)
-
-                if cost < best_cost:
-                    best_cost  = cost
-                    best_v     = v
-                    best_omega = omega
+                trajectories.append({
+                    'v': v, 'om': omega,
+                    'g': goal_cost, 'tg': to_goal_cost,
+                    'ob': obs_cost, 's': speed_cost,
+                    'pen': penalty,
+                })
 
         # Anti-freeze: if no valid trajectory found, rotate in place
-        if best_cost == float('inf'):
-            best_v, best_omega = 0.0, self.max_omega * 0.5
+        if not trajectories:
+            self.get_logger().warn('DR.Nav DWA: all blocked — spinning',
+                                   throttle_duration_sec=1.0)
+            return 0.0, self.max_omega * 0.5
+
+        # ── 2. Normalise each cost term across valid trajectories ─────────────
+        # Divide by sum so each term contributes in [0,1] range before weighting.
+        # Penalty is already bounded by penalty_w so normalise it separately.
+        sum_g   = sum(t['g']   for t in trajectories) or 1.0
+        sum_tg  = sum(t['tg']  for t in trajectories) or 1.0
+        sum_ob  = sum(t['ob']  for t in trajectories) or 1.0
+        sum_s   = sum(t['s']   for t in trajectories) or 1.0
+        sum_pen = sum(t['pen'] for t in trajectories) or 1.0
+
+        # ── 3. Score and pick best ────────────────────────────────────────────
+        best_score = float('inf')
+        best_v, best_omega = 0.0, 0.0
+
+        for t in trajectories:
+            score = (self.w_heading * (t['g']   / sum_g)   +
+                     self.w_to_goal * (t['tg']  / sum_tg)  +
+                     self.w_dist    * (t['ob']  / sum_ob)  +
+                     self.w_vel     * (t['s']   / sum_s)   +
+                     self.penalty_w * (t['pen'] / sum_pen))
+            if score < best_score:
+                best_score = score
+                best_v, best_omega = t['v'], t['om']
 
         return best_v, best_omega
 
