@@ -30,6 +30,7 @@ from tf2_ros import TransformListener, Buffer
 import math
 import time
 import numpy as np
+from scipy.ndimage import binary_dilation
 
 from map_contruct.scripts.utilities.recovery_points import RecoveryPointManager
 
@@ -64,6 +65,10 @@ class DRaMRiskMap(Node):
         # Sector overlay — RViz debug only
         self.cost_layer_pub = self.create_publisher(
             MarkerArray, '/cost_layer', 10
+        )
+        # Local costmap as OccupancyGrid — for RViz2 comparison with baselines
+        self.local_costmap_pub = self.create_publisher(
+            OccupancyGrid, '/local_costmap', 10
         )
 
         # ── TF ───────────────────────────────────────────────────────────
@@ -146,6 +151,9 @@ class DRaMRiskMap(Node):
 
         # 5. Publish dram_exploration_map ─────────────────────────────────
         self._publish_exploration_map(frame_id)
+
+        # 6. Publish local costmap (OccupancyGrid for RViz comparison) ────
+        self._publish_local_costmap(robot_x, robot_y, frame_id)
 
         # Clean old cost history
         cutoff = current_time - self.max_history_age
@@ -432,6 +440,43 @@ class DRaMRiskMap(Node):
             marker_id += 1
 
         self.risk_map_pub.publish(marker_array)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Local costmap publishing (/local_costmap)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _publish_local_costmap(self, rx, ry, frame_id):
+        """Convert explored_grid Bayesian safety scores → OccupancyGrid."""
+        res = self.grid_resolution          # 0.3 m/cell
+        half = 5.0                          # 10 m × 10 m window
+        n = int(math.ceil(2 * half / res))  # cells per side (~34)
+
+        grid = np.full((n, n), -1, dtype=np.int8)  # -1 = unknown
+
+        origin_x = rx - half
+        origin_y = ry - half
+
+        for row in range(n):
+            for col in range(n):
+                wx = origin_x + (col + 0.5) * res
+                wy = origin_y + (row + 0.5) * res
+                key = (int(math.floor(wx / res)), int(math.floor(wy / res)))
+                if key in self.explored_grid:
+                    safety = self.explored_grid[key]['safety']
+                    # safety 0.0 → cost 100 (dead end), 1.0 → cost 0 (free)
+                    grid[row, col] = int(round((1.0 - safety) * 100))
+
+        msg = OccupancyGrid()
+        msg.header.frame_id = frame_id
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.info.resolution = res
+        msg.info.width = n
+        msg.info.height = n
+        msg.info.origin.position.x = origin_x
+        msg.info.origin.position.y = origin_y
+        msg.info.origin.orientation.w = 1.0
+        msg.data = grid.flatten().tolist()
+        self.local_costmap_pub.publish(msg)
 
     # ─────────────────────────────────────────────────────────────────────
     # TF helper

@@ -93,12 +93,24 @@ def launch_setup(context, *args, **kwargs):
     if method == 'dwa':
         nodes.append(Node(
             package='map_contruct',
+            executable='global_planner',
+            name='global_planner',
+            output='screen',
+        ))
+        nodes.append(Node(
+            package='map_contruct',
             executable='dwa_planner',
             name='dwa_planner',
             output='screen',
         ))
 
     elif method == 'mppi':
+        nodes.append(Node(
+            package='map_contruct',
+            executable='global_planner',
+            name='global_planner',
+            output='screen',
+        ))
         nodes.append(Node(
             package='map_contruct',
             executable='mppi_planner',
@@ -120,6 +132,12 @@ def launch_setup(context, *args, **kwargs):
     # Goal:             from RViz2 /move_base_simple/goal
 
     elif method == 'dram':
+        nodes.append(Node(
+            package='map_contruct',
+            executable='global_planner',
+            name='global_planner',
+            output='screen',
+        ))
         nodes.append(Node(
             package='map_contruct',
             executable='pointcloud_segmenter',

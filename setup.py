@@ -23,6 +23,9 @@ setup(
     license='Apache License 2.0',
     entry_points={
         'console_scripts': [
+            # Shared global planner
+            'global_planner = map_contruct.scripts.planning.global_planner:main',
+
             # Baselines
             'dwa_planner = map_contruct.baselines.dwa.dwa_planner:main',
             'mppi_planner = map_contruct.baselines.mppi.mppi_planner:main',
