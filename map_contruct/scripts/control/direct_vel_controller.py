@@ -53,7 +53,7 @@ class DirectVelController(Node):
         self.goal_weight      = 3.0    # goal dominates model's forward bias
         self.blocked_thr      = 0.65   # path score below this → blocked
         self.goal_tol         = 0.5    # goal-reached radius (m)
-        self.recovery_v       = -0.15  # reverse speed during short recovery (m/s)
+        self.recovery_v       = 0.3  # reverse speed during short recovery (m/s)
         self.recovery_omega   = 0.8    # rotation speed during short recovery (rad/s)
         self.stuck_window     = 30     # ticks (10 Hz) for stuck detection = 3 s
         self.stuck_dist       = 0.05   # metres — spread below this = stuck
@@ -230,7 +230,7 @@ class DirectVelController(Node):
         if self.nav_state == 'navigating':
 
             # Save junction whenever ≥2 paths are open
-            if open_count >= 2:
+            if open_count >= 1:
                 self.junction_point = (rx, ry)
 
             # Confirmed dead end after consecutive model detections
@@ -281,7 +281,7 @@ class DirectVelController(Node):
                 self.in_recovery  = True
                 self.recovery_dir = math.copysign(1.0, goal_robot_angle)
                 self.get_logger().info(
-                    f'Short recovery: reversing (F={F:.2f} L={L:.2f} R={R:.2f})')
+                    f'Short recovery: (F={F:.2f} L={L:.2f} R={R:.2f})')
             cmd.linear.x  = self.recovery_v
             cmd.angular.z = self.recovery_dir * self.recovery_omega
             self.cmd_pub.publish(cmd)
