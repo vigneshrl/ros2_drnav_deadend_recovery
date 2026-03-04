@@ -175,9 +175,12 @@ class DwaPlannerNode(Node):
         # Extract carrot point from A* path (1.5 m lookahead)
         local_gx, local_gy = self._get_carrot(robot_x, robot_y, gx, gy)
 
+        # Pre-compute scan obstacle world positions once per cycle
+        obstacle_pts = self._scan_to_world(robot_x, robot_y, robot_theta)
+
         # True DWA planning
         best_v, best_omega = self._dwa_plan(
-            robot_x, robot_y, robot_theta, local_gx, local_gy)
+            robot_x, robot_y, robot_theta, local_gx, local_gy, obstacle_pts)
 
         # Update tracked velocities
         self.current_v     = best_v
@@ -233,7 +236,20 @@ class DwaPlannerNode(Node):
         om_max = min( self.max_omega, self.current_omega + self.max_delta_yaw * self.dt)
         return v_min, v_max, om_min, om_max
 
-    def _dwa_plan(self, rx, ry, rtheta, gx, gy):
+    def _scan_to_world(self, rx, ry, rtheta):
+        """Convert current scan to obstacle (x, y) positions in world frame."""
+        pts = []
+        if self.last_scan is None:
+            return pts
+        scan = self.last_scan
+        for i, r in enumerate(scan.ranges):
+            if not (scan.range_min < r < scan.range_max):
+                continue
+            ang = scan.angle_min + i * scan.angle_increment + rtheta
+            pts.append((rx + r * math.cos(ang), ry + r * math.sin(ang)))
+        return pts
+
+    def _dwa_plan(self, rx, ry, rtheta, gx, gy, obstacle_pts):
         """
         Sample velocities within the dynamic window, simulate trajectories,
         score each, and return the best (v, omega).
@@ -251,7 +267,7 @@ class DwaPlannerNode(Node):
                 traj = self._predict_trajectory(rx, ry, rtheta, v, omega)
 
                 # Obstacle cost (collision → inf)
-                ob_cost = self._obstacle_cost(traj)
+                ob_cost = self._obstacle_cost(traj, obstacle_pts)
                 if ob_cost == float('inf'):
                     continue
 
@@ -270,10 +286,11 @@ class DwaPlannerNode(Node):
                     best_v     = v
                     best_omega = omega
 
-        # Anti-freeze: if best velocity is near zero, force a turn
-        if (abs(best_v) < self.robot_stuck_flag and
-                abs(self.current_omega) < self.robot_stuck_flag):
-            best_omega = -self.max_delta_yaw * self.dt
+        # Anti-freeze: if no valid trajectory or near-zero output, force turn
+        if best_cost == float('inf') or (
+                abs(best_v) < self.robot_stuck_flag and
+                abs(best_omega) < self.robot_stuck_flag):
+            best_omega = self.max_delta_yaw * self.dt
 
         return best_v, best_omega
 
@@ -300,32 +317,25 @@ class DwaPlannerNode(Node):
         cost_angle  = error_angle - traj[-1, 2]
         return abs(math.atan2(math.sin(cost_angle), math.cos(cost_angle)))
 
-    def _obstacle_cost(self, traj):
+    def _obstacle_cost(self, traj, obstacle_pts):
         """
         1 / min_obstacle_distance (reference formula).
-        Returns inf if any trajectory point is within robot_radius of an obstacle.
+        Returns inf if any trajectory point collides with map or scan obstacles.
+        obstacle_pts: pre-computed obstacle world positions from _scan_to_world().
         """
         min_r = float('inf')
         for state in traj:
             x, y = state[0], state[1]
-            if state[3] < 1e-9:   # rotation in place — don't check occupancy
+            if state[3] < 1e-9:   # rotation in place — skip occupancy check
                 continue
-            # Map-based collision
             if self._is_occupied(x, y):
                 return float('inf')
-            # Scan-based minimum obstacle distance
-            if self.last_scan is not None:
-                scan = self.last_scan
-                for i, r in enumerate(scan.ranges):
-                    if not (scan.range_min < r < scan.range_max):
-                        continue
-                    ang = scan.angle_min + i * scan.angle_increment
-                    ox  = x + r * math.cos(ang + state[2])
-                    oy  = y + r * math.sin(ang + state[2])
-                    d   = math.hypot(state[0] - ox, state[1] - oy)
-                    if d < self.robot_radius:
-                        return float('inf')
-                    min_r = min(min_r, d)
+            for ox, oy in obstacle_pts:
+                d = math.hypot(x - ox, y - oy)
+                if d < self.robot_radius:
+                    return float('inf')
+                if d < min_r:
+                    min_r = d
 
         if min_r == float('inf'):
             return 0.0
@@ -338,7 +348,7 @@ class DwaPlannerNode(Node):
         gx   = int((x - info.origin.position.x) / info.resolution)
         gy   = int((y - info.origin.position.y) / info.resolution)
         if gx < 0 or gx >= info.width or gy < 0 or gy >= info.height:
-            return True
+            return False  # unknown = free (allow planning near/beyond map edge)
         return bool(self.inflated_mask[gy, gx])
 
     # ── Local costmap ──────────────────────────────────────────────────────────

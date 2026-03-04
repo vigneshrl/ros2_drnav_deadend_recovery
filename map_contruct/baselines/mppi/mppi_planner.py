@@ -276,7 +276,7 @@ class MppiPlannerNode(Node):
         gx   = int((x - info.origin.position.x) / info.resolution)
         gy   = int((y - info.origin.position.y) / info.resolution)
         if gx < 0 or gx >= info.width or gy < 0 or gy >= info.height:
-            return True
+            return False  # unknown = free (allow planning near/beyond map edge)
         return bool(self.inflated_mask[gy, gx])
 
     # ── Local costmap ──────────────────────────────────────────────────────────
