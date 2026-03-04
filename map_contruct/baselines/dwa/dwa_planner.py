@@ -344,15 +344,23 @@ class DwaPlannerNode(Node):
             return 0.0
 
         min_r = float('inf')
-        for state in traj:
+        for i, state in enumerate(traj):
             x, y = state[0], state[1]
             moving = state[3] >= 1e-9
 
-            # Map collision only when moving (robot may rotate near inflated cells)
+            if i == 0:
+                # Current position: only track distance for continuous cost,
+                # never hard-reject (robot is already here).
+                for ox, oy in obstacle_pts:
+                    d = math.hypot(x - ox, y - oy)
+                    if d < min_r:
+                        min_r = d
+                continue
+
+            # Future states: hard collision check
             if moving and self._is_occupied(x, y):
                 return float('inf')
 
-            # Scan-based distance — collision checked for ALL states (including v=0)
             for ox, oy in obstacle_pts:
                 d = math.hypot(x - ox, y - oy)
                 if d < self.robot_radius + 0.1:   # +0.1 m safety clearance
