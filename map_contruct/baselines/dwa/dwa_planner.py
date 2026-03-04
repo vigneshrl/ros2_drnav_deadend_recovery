@@ -68,7 +68,7 @@ class DwaPlannerNode(Node):
         # DWA scoring gains (reference values — to_goal_gain deliberately small
         # so obstacle avoidance is not overwhelmed by heading error)
         self.to_goal_gain       = 1.5     # heading-error cost weight
-        self.speed_gain         = 2.0     # reward forward speed
+        self.speed_gain         = 0.5     # reward forward speed
         self.obstacle_gain      = 1.0     # obstacle cost weight
         self.robot_stuck_flag   = 0.001   # minimum v/omega to prevent freeze
         # Velocity sampling resolution inside dynamic window
@@ -259,52 +259,60 @@ class DwaPlannerNode(Node):
         Sample velocities within the dynamic window, simulate trajectories,
         score each, and return the best (v, omega).
         """
+
+        trajectories = []
         v_min, v_max, om_min, om_max = self._calc_dynamic_window()
 
         v_samples  = np.linspace(v_min,  v_max,  self.v_samples)
         om_samples = np.linspace(om_min, om_max, self.omega_samples)
 
-        best_cost = float('inf')
-        best_v, best_omega = 0.0, 0.0
-
         for v in v_samples:
             for omega in om_samples:
                 traj = self._predict_trajectory(rx, ry, rtheta, v, omega)
 
-                # Obstacle cost (collision → inf)
+                # Obstacle cost (collision → inf, skip trajectory)
                 ob_cost = self._obstacle_cost(traj, obstacle_pts)
                 if ob_cost == float('inf'):
                     continue
 
-                # Goal cost: heading error at trajectory endpoint (reference formula)
+                # Goal cost: heading error at trajectory endpoint
                 goal_cost = self._to_goal_cost(traj, gx, gy)
 
                 # Speed cost: reward high speed
                 speed_cost = self.max_speed - traj[-1, 3]
 
-                total = (self.to_goal_gain   * goal_cost +
-                         self.speed_gain     * speed_cost +
-                         self.obstacle_gain  * ob_cost)
-
-                if total < best_cost:
-                    best_cost  = total
-                    best_v     = v
-                    best_omega = omega
+                trajectories.append({'v': v, 'om': omega,
+                                     'g': goal_cost, 'ob': ob_cost, 's': speed_cost})
 
         # Anti-freeze: if no valid trajectory, stop and spin
-        if best_cost == float('inf'):
+        if not trajectories:
             self.get_logger().warn('DWA: all trajectories blocked — forcing turn',
                                    throttle_duration_sec=1.0)
-            best_v     = 0.0
-            best_omega = self.max_omega
-        elif abs(best_v) < self.robot_stuck_flag and abs(best_omega) < self.robot_stuck_flag:
-            best_v     = 0.0
-            best_omega = self.max_omega
+            return 0.0, self.max_omega
+
+        # Normalize each cost across all valid trajectories, then score
+        sum_g  = sum(t['g']  for t in trajectories) or 1.0
+        sum_ob = sum(t['ob'] for t in trajectories) or 1.0
+        sum_s  = sum(t['s']  for t in trajectories) or 1.0
+
+        best_score = float('inf')
+        best_v, best_omega = 0.0, 0.0
+
+        for t in trajectories:
+            score = (self.to_goal_gain  * (t['g']  / sum_g)  +
+                     self.obstacle_gain * (t['ob'] / sum_ob) +
+                     self.speed_gain    * (t['s']  / sum_s))
+            if score < best_score:
+                best_score = score
+                best_v, best_omega = t['v'], t['om']
+
+        if abs(best_v) < self.robot_stuck_flag and abs(best_omega) < self.robot_stuck_flag:
+            best_v, best_omega = 0.0, self.max_omega
 
         self.get_logger().debug(
             f'DWA: v={best_v:.3f} ω={best_omega:.3f}  '
             f'dyn_win=[{v_min:.3f},{v_max:.3f}]  '
-            f'obstacles={len(obstacle_pts)}',
+            f'valid_traj={len(trajectories)}',
             throttle_duration_sec=0.5)
 
         return best_v, best_omega
