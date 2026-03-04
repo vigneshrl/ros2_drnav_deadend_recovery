@@ -4,6 +4,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import OccupancyGrid
+from sensor_msgs.msg import LaserScan
 from tf2_ros import TransformListener, Buffer
 import numpy as np
 import math
@@ -30,6 +31,12 @@ class MppiPlannerNode(Node):
             self.map_callback,
             10
         )
+        self.scan_sub = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.scan_callback,
+            10
+        )
 
         # Publisher
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -43,6 +50,8 @@ class MppiPlannerNode(Node):
         self.occupancy_grid = None
         self.inflated_mask = None          # precomputed inflated occupancy (numpy bool)
         self.inflation_radius = 0.35       # Jackal half-diagonal (0.33 m) + 2 cm margin
+        self.front_min_range = 999.0       # latest min range in front sector (metres)
+        self.prox_stop_dist  = 0.4         # hard stop if obstacle within this distance
 
         # MPPI parameters
         self.max_speed = 0.5
@@ -75,6 +84,13 @@ class MppiPlannerNode(Node):
 
         self.create_timer(0.1, self.plan_and_publish)
         self.get_logger().info('MPPI Planner (geometric baseline) initialized')
+
+    def scan_callback(self, msg: LaserScan):
+        """Track minimum range in the front ±30° sector."""
+        front = [r for i, r in enumerate(msg.ranges)
+                 if (abs(msg.angle_min + i * msg.angle_increment) < math.pi / 6
+                     and msg.range_min < r < msg.range_max)]
+        self.front_min_range = min(front) if front else 999.0
 
     def goal_callback(self, msg):
         self.current_goal = {'x': msg.pose.position.x, 'y': msg.pose.position.y}
@@ -127,6 +143,11 @@ class MppiPlannerNode(Node):
             return
 
         if not self.current_goal:
+            self.cmd_pub.publish(Twist())
+            return
+
+        # LaserScan proximity: hard stop if wall < 0.4 m in front sector
+        if self.front_min_range < self.prox_stop_dist:
             self.cmd_pub.publish(Twist())
             return
 
