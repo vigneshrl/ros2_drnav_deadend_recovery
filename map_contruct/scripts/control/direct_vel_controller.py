@@ -41,8 +41,8 @@ class DrNavDWAController(Node):
         super().__init__('dr_nav_dwa_controller')
 
         # ── DWA parameters ───────────────────────────────────────────────────
-        self.max_speed        = 0.5
-        self.min_speed        = 0.0
+        self.max_speed        = 1.0
+        self.min_speed        = 0.2
         self.max_omega        = 1.0
         self.max_accel        = 0.5
         self.max_delta_yaw    = 1.0
@@ -63,6 +63,7 @@ class DrNavDWAController(Node):
         self.prox_stop_dist  = 0.4
         self.blocked_thr     = 0.56
         self.consecutive_thr = 5
+        self.robot_radius    = 0.5   # inflate obstacle check — increase to make robot more conservative
 
         # ── State ─────────────────────────────────────────────────────────────
         self.nav_state           = 'navigating'  # 'navigating' | 'recovering'
@@ -82,8 +83,8 @@ class DrNavDWAController(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Subscribers
-        self.create_subscription(Path,             '/global_path',
-                                 self._path_cb,            10)
+        # self.create_subscription(Path,             '/global_path',
+        #                          self._path_cb,            10)
         self.create_subscription(PoseStamped,      '/goal_pose',
                                  self._goal_cb,            10)
         self.create_subscription(OccupancyGrid,    '/local_costmap',
@@ -103,9 +104,9 @@ class DrNavDWAController(Node):
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
-    def _path_cb(self, msg: Path):
-        self.global_path = [(p.pose.position.x, p.pose.position.y)
-                            for p in msg.poses]
+    # def _path_cb(self, msg: Path):
+    #     self.global_path = [(p.pose.position.x, p.pose.position.y)
+    #                         for p in msg.poses]
 
     def _goal_cb(self, msg: PoseStamped):
         self.current_goal        = (msg.pose.position.x, msg.pose.position.y)
@@ -197,9 +198,8 @@ class DrNavDWAController(Node):
             self.consecutive_blocked = 0
             gx, gy = self.current_goal
 
-        # DWA
-        carrot = self._get_carrot(rx, ry, gx, gy)
-        best_v, best_omega = self._dwa(rx, ry, ryaw, carrot)
+        # DWA — use goal directly as carrot (no global path)
+        best_v, best_omega = self._dwa(rx, ry, ryaw, (gx, gy))
 
         cmd = Twist()
         cmd.linear.x  = best_v
@@ -304,14 +304,23 @@ class DrNavDWAController(Node):
 
     def _obstacle_cost(self, traj):
         """Max DRAM risk score along the trajectory, normalised to [0, 1].
-        High DRAM cost (predicted dead end) → high obstacle cost → DWA steers away.
-        Unknown cells (−1) are treated as neutral (0).
+        Samples a circle of robot_radius around each trajectory point so the
+        robot treats nearby high-cost cells as obstacles (inflation in DWA space).
         """
+        if self.dram_costmap is None:
+            return 0.0
+        res = self.dram_costmap.info.resolution
+        n   = max(1, int(self.robot_radius / res))
+        offsets = [(dx * res, dy * res)
+                   for dx in range(-n, n + 1)
+                   for dy in range(-n, n + 1)
+                   if math.hypot(dx, dy) <= n]
         max_val = 0
         for row in traj:
-            c = self._dram_cost_at(row[0], row[1])
-            if c > max_val:
-                max_val = c
+            for ox, oy in offsets:
+                c = self._dram_cost_at(row[0] + ox, row[1] + oy)
+                if c > max_val:
+                    max_val = c
         return max_val / 100.0
 
     def _dram_cost_at(self, wx, wy):

@@ -56,17 +56,17 @@ class DwaPlannerNode(Node):
         super().__init__('dwa_planner_node')
 
         # ── Robot / DWA parameters (from reference) ──────────────────────────
-        self.max_speed          = 0.5     # [m/s]
-        self.min_speed          = 0.0     # [m/s]  (no reverse)
+        self.max_speed          = 1.0     # [m/s]
+        self.min_speed          = 0.5     # [m/s]  (no reverse)
         self.max_omega          = 1.0     # [rad/s]
-        self.max_accel          = 0.2     # [m/s²]
-        self.max_delta_yaw      = 0.8     # [rad/s²]
-        self.robot_radius       = 0.35    # [m] for collision check
+        self.max_accel          = 0.5     # [m/s²]  higher → faster ramp-up
+        self.max_delta_yaw      = 1.0     # [rad/s²]
+        self.robot_radius       = 0.5    # [m] for collision check
         self.dt                 = 0.1     # [s] control timestep
         self.predict_time       = 2.0     # [s] trajectory simulation horizon
-        # DWA scoring gains (reference defaults)
+        # DWA scoring gains
         self.to_goal_gain       = 0.15    # heading-error cost weight
-        self.speed_gain         = 1.0     # speed cost weight
+        self.speed_gain         = 2.0     # higher → robot strongly prefers moving
         self.obstacle_gain      = 1.0     # obstacle cost weight
         self.robot_stuck_flag   = 0.001   # minimum v/omega to prevent freeze
         # Velocity sampling resolution inside dynamic window
@@ -77,7 +77,7 @@ class DwaPlannerNode(Node):
         self.goal_tol           = 0.5     # [m] goal-reached tolerance
         self.carrot_dist        = 1.5     # [m] lookahead on A* path
         self.prox_stop_dist     = 0.4     # [m] hard stop if obstacle this close in front
-        self.inflation_radius   = 0.35    # [m] obstacle inflation for map checks
+        self.inflation_radius   = 0.5    # [m] obstacle inflation for map checks
 
         # ── Local costmap parameters ──────────────────────────────────────────
         self.lc_size            = 10.0    # [m] local costmap window side length
@@ -108,7 +108,7 @@ class DwaPlannerNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Subscribers
-        self.create_subscription(Path,          '/global_path', self._path_cb,  10)
+        # self.create_subscription(Path,          '/global_path', self._path_cb,  10)
         self.create_subscription(PoseStamped,   '/goal_pose',   self._goal_cb,  10)
         self.create_subscription(OccupancyGrid, '/map',         self._map_cb,   10)
         self.create_subscription(LaserScan,     '/scan',        self._scan_cb,  10)
@@ -122,8 +122,8 @@ class DwaPlannerNode(Node):
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
-    def _path_cb(self, msg: Path):
-        self.global_path = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+    # def _path_cb(self, msg: Path):
+    #     self.global_path = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
 
     def _goal_cb(self, msg: PoseStamped):
         self.current_goal = (msg.pose.position.x, msg.pose.position.y)
@@ -158,6 +158,9 @@ class DwaPlannerNode(Node):
 
         # Hard stop if wall too close in front
         if self.front_min_range < self.prox_stop_dist:
+            self.get_logger().warn(
+                f'PROX STOP: front={self.front_min_range:.2f} m < {self.prox_stop_dist} m',
+                throttle_duration_sec=1.0)
             self.cmd_pub.publish(Twist())
             self.current_v = 0.0
             return
@@ -173,14 +176,14 @@ class DwaPlannerNode(Node):
             return
 
         # Extract carrot point from A* path (1.5 m lookahead)
-        local_gx, local_gy = self._get_carrot(robot_x, robot_y, gx, gy)
+        # local_gx, local_gy = self._get_carrot(robot_x, robot_y, gx, gy)
 
         # Pre-compute scan obstacle world positions once per cycle
         obstacle_pts = self._scan_to_world(robot_x, robot_y, robot_theta)
 
         # True DWA planning
         best_v, best_omega = self._dwa_plan(
-            robot_x, robot_y, robot_theta, local_gx, local_gy, obstacle_pts)
+            robot_x, robot_y, robot_theta, gx, gy, obstacle_pts)
 
         # Update tracked velocities
         self.current_v     = best_v
@@ -286,11 +289,19 @@ class DwaPlannerNode(Node):
                     best_v     = v
                     best_omega = omega
 
-        # Anti-freeze: if no valid trajectory or near-zero output, force turn
-        if best_cost == float('inf') or (
-                abs(best_v) < self.robot_stuck_flag and
-                abs(best_omega) < self.robot_stuck_flag):
+        # Anti-freeze: if no valid trajectory, force turn
+        if best_cost == float('inf'):
+            self.get_logger().warn('DWA: all trajectories blocked — forcing turn',
+                                   throttle_duration_sec=1.0)
             best_omega = self.max_delta_yaw * self.dt
+        elif abs(best_v) < self.robot_stuck_flag and abs(best_omega) < self.robot_stuck_flag:
+            best_omega = self.max_delta_yaw * self.dt
+
+        self.get_logger().debug(
+            f'DWA: v={best_v:.3f} ω={best_omega:.3f}  '
+            f'dyn_win=[{v_min:.3f},{v_max:.3f}]  '
+            f'obstacles={len(obstacle_pts)}',
+            throttle_duration_sec=0.5)
 
         return best_v, best_omega
 
@@ -320,25 +331,33 @@ class DwaPlannerNode(Node):
     def _obstacle_cost(self, traj, obstacle_pts):
         """
         1 / min_obstacle_distance (reference formula).
-        Returns inf if any trajectory point collides with map or scan obstacles.
+        Returns inf if any moving trajectory point collides.
         obstacle_pts: pre-computed obstacle world positions from _scan_to_world().
+
+        NOTE: scan-based distance is computed for ALL states (including v=0) so
+        that rotation-in-place is not artificially free — it pays the same 1/dist
+        cost as forward motion, preventing the DWA from preferring v=0.
         """
+        if not obstacle_pts:
+            return 0.0
+
         min_r = float('inf')
         for state in traj:
             x, y = state[0], state[1]
-            if state[3] < 1e-9:   # rotation in place — skip occupancy check
-                continue
-            if self._is_occupied(x, y):
+            moving = state[3] >= 1e-9
+
+            # Map collision only when moving (robot may rotate near inflated cells)
+            if moving and self._is_occupied(x, y):
                 return float('inf')
+
+            # Scan-based distance — always measured (even for v=0)
             for ox, oy in obstacle_pts:
                 d = math.hypot(x - ox, y - oy)
-                if d < self.robot_radius:
+                if moving and d < self.robot_radius:
                     return float('inf')
                 if d < min_r:
                     min_r = d
 
-        if min_r == float('inf'):
-            return 0.0
         return 1.0 / min_r
 
     def _is_occupied(self, x, y):

@@ -39,7 +39,7 @@ class Config:
     def __init__(self):
         # robot parameter
         self.max_speed = 1.0  # [m/s]
-        self.min_speed = -0.5  # [m/s]
+        self.min_speed = 0.5  # [m/s]
         self.max_yaw_rate = 40.0 * math.pi / 180.0  # [rad/s]
         self.max_accel = 0.2  # [m/ss]
         self.max_delta_yaw_rate = 40.0 * math.pi / 180.0  # [rad/ss]
@@ -52,6 +52,7 @@ class Config:
         self.obstacle_cost_gain = 1.0
         self.robot_stuck_flag_cons = 0.001  # constant to prevent robot stucked
         self.robot_type = RobotType.circle
+        # self.robot_radius = 0.5  # [m] for collision check
 
         # if robot_type == RobotType.circle
         # Also used to check if goal is reached in both types
