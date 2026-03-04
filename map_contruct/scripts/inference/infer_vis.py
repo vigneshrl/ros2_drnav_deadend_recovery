@@ -501,7 +501,7 @@ class DeadEndDetectionNodeWithVisualization(Node):
             self.total_processed += 1
             
             # Apply correct dead-end logic for results storage
-            threshold = 0.35
+            threshold = 0.65
             front_open = path_probs[0] > threshold
             left_open = path_probs[1] > threshold  
             right_open = path_probs[2] > threshold
