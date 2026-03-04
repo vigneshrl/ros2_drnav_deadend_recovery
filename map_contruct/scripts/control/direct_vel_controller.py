@@ -42,7 +42,7 @@ class DrNavDWAController(Node):
 
         # ── DWA parameters ───────────────────────────────────────────────────
         self.max_speed        = 1.0
-        self.min_speed        = 0.2
+        self.min_speed        = 0.0
         self.max_omega        = 1.0
         self.max_accel        = 0.5
         self.max_delta_yaw    = 1.0
@@ -52,9 +52,10 @@ class DrNavDWAController(Node):
         self.omega_resolution = 0.1
 
         # DWA cost weights
-        self.w_heading  = 0.15
-        self.w_dist     = 1.0
-        self.w_vel      = 0.1
+        self.w_heading  = 0.15   # heading alignment to carrot
+        self.w_dist     = 1.0    # DRAM obstacle cost
+        self.w_vel      = 0.1    # speed gain (penalises slow trajectories)
+        self.w_to_goal  = 0.3    # distance from trajectory end to carrot
         self.penalty_w  = 2.0    # dead-end direction penalty weight
 
         # ── Navigation parameters ────────────────────────────────────────────
@@ -64,6 +65,14 @@ class DrNavDWAController(Node):
         self.blocked_thr     = 0.56
         self.consecutive_thr = 5
         self.robot_radius    = 0.5   # inflate obstacle check — increase to make robot more conservative
+
+        # Stuck detection — triggers recovery subgoal if robot doesn't progress
+        self.stuck_check_steps = 20    # check every 20 ticks (~2 s at 10 Hz)
+        self.stuck_dist_thr    = 0.15  # must move at least 15 cm per check interval
+        self.stuck_thr         = 3     # consecutive stuck checks before recovery
+        self.stuck_count       = 0
+        self.stuck_tick        = 0
+        self.stuck_ref_pos     = None
 
         # ── State ─────────────────────────────────────────────────────────────
         self.nav_state           = 'navigating'  # 'navigating' | 'recovering'
@@ -114,6 +123,9 @@ class DrNavDWAController(Node):
         self.nav_state           = 'navigating'
         self.consecutive_blocked = 0
         self.dead_end_yaw        = None
+        self.stuck_count         = 0
+        self.stuck_tick          = 0
+        self.stuck_ref_pos       = None
         self.get_logger().info(
             f'Goal: ({self.current_goal[0]:.2f}, {self.current_goal[1]:.2f})')
 
@@ -180,22 +192,33 @@ class DrNavDWAController(Node):
             self.cmd_pub.publish(Twist())
             return
 
+        # Stuck detection — check every stuck_check_steps ticks
+        if self.nav_state == 'navigating':
+            self.stuck_tick += 1
+            if self.stuck_tick >= self.stuck_check_steps:
+                self.stuck_tick = 0
+                if self.stuck_ref_pos is None:
+                    self.stuck_ref_pos = (rx, ry)
+                else:
+                    moved = math.hypot(rx - self.stuck_ref_pos[0],
+                                       ry - self.stuck_ref_pos[1])
+                    self.stuck_ref_pos = (rx, ry)
+                    if moved < self.stuck_dist_thr:
+                        self.stuck_count += 1
+                    else:
+                        self.stuck_count = 0
+            if self.stuck_count >= self.stuck_thr:
+                self.get_logger().warn(
+                    f'Robot stuck (×{self.stuck_count}). Using recovery point as subgoal.')
+                self._trigger_recovery(rx, ry, ryaw)
+                gx, gy = self.current_goal
+
         # Dead-end confirmation → trigger recovery
         if (self.nav_state == 'navigating' and
                 self.consecutive_blocked >= self.consecutive_thr):
-            self.dead_end_yaw = ryaw  # direction robot was heading into dead end
-            target = self._best_recovery_point(rx, ry)
-            if target is None:
-                # Fallback: 1.5 m directly behind current heading
-                target = (rx - 1.5 * math.cos(ryaw),
-                          ry - 1.5 * math.sin(ryaw))
             self.get_logger().warn(
-                f'Dead end confirmed (×{self.consecutive_blocked}). '
-                f'Recovering to ({target[0]:.2f}, {target[1]:.2f})')
-            self.original_goal       = self.current_goal
-            self.current_goal        = target
-            self.nav_state           = 'recovering'
-            self.consecutive_blocked = 0
+                f'Dead end confirmed (×{self.consecutive_blocked}). Triggering recovery.')
+            self._trigger_recovery(rx, ry, ryaw)
             gx, gy = self.current_goal
 
         # DWA — use goal directly as carrot (no global path)
@@ -253,9 +276,10 @@ class DrNavDWAController(Node):
                 if traj is None:
                     continue
 
-                goal_cost  = self._heading_cost(traj, carrot)
-                obs_cost   = self._obstacle_cost(traj)
-                speed_cost = self.max_speed - traj[-1, 3]
+                goal_cost    = self._heading_cost(traj, carrot)
+                to_goal_cost = self._to_goal_cost(traj, carrot)
+                obs_cost     = self._obstacle_cost(traj)
+                speed_cost   = self.max_speed - traj[-1, 3]
 
                 # Penalise trajectories heading back toward the dead-end direction
                 penalty = 0.0
@@ -266,9 +290,10 @@ class DrNavDWAController(Node):
                         math.cos(final_heading - self.dead_end_yaw))
                     penalty = self.penalty_w * max(0.0, math.cos(delta))
 
-                cost = (self.w_heading * goal_cost +
-                        self.w_dist   * obs_cost   +
-                        self.w_vel    * speed_cost +
+                cost = (self.w_heading * goal_cost    +
+                        self.w_to_goal * to_goal_cost +
+                        self.w_dist   * obs_cost      +
+                        self.w_vel    * speed_cost    +
                         penalty)
 
                 if cost < best_cost:
@@ -301,6 +326,14 @@ class DrNavDWAController(Node):
         error_angle    = math.atan2(dy, dx)
         cost_angle     = error_angle - ftheta
         return abs(math.atan2(math.sin(cost_angle), math.cos(cost_angle)))
+
+    def _to_goal_cost(self, traj, carrot):
+        """Euclidean distance from trajectory endpoint to carrot, normalised by
+        predict horizon so it's roughly in [0, 1] regardless of goal distance."""
+        fx, fy = traj[-1, 0], traj[-1, 1]
+        dist   = math.hypot(carrot[0] - fx, carrot[1] - fy)
+        horizon = self.max_speed * self.predict_time  # max reachable distance
+        return min(dist / horizon, 1.0)
 
     def _obstacle_cost(self, traj):
         """Max DRAM risk score along the trajectory, normalised to [0, 1].
@@ -341,6 +374,23 @@ class DrNavDWAController(Node):
         return max(0, val)  # treat -1 (unknown) as 0
 
     # ── Recovery helpers ───────────────────────────────────────────────────────
+
+    def _trigger_recovery(self, rx, ry, ryaw):
+        """Set the best recovery point as the current subgoal and enter recovering state."""
+        self.dead_end_yaw = ryaw
+        target = self._best_recovery_point(rx, ry)
+        if target is None:
+            target = (rx - 1.5 * math.cos(ryaw),
+                      ry - 1.5 * math.sin(ryaw))
+        self.get_logger().warn(
+            f'Recovering to ({target[0]:.2f}, {target[1]:.2f})')
+        self.original_goal       = self.current_goal
+        self.current_goal        = target
+        self.nav_state           = 'recovering'
+        self.consecutive_blocked = 0
+        self.stuck_count         = 0
+        self.stuck_tick          = 0
+        self.stuck_ref_pos       = None
 
     def _best_recovery_point(self, rx, ry):
         """Return the closest saved recovery point, or None if none available."""

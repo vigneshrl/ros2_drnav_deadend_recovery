@@ -352,10 +352,10 @@ class DwaPlannerNode(Node):
             if moving and self._is_occupied(x, y):
                 return float('inf')
 
-            # Scan-based distance — always measured (even for v=0)
+            # Scan-based distance — collision checked for ALL states (including v=0)
             for ox, oy in obstacle_pts:
                 d = math.hypot(x - ox, y - oy)
-                if moving and d < self.robot_radius:
+                if d < self.robot_radius + 0.1:   # +0.1 m safety clearance
                     return float('inf')
                 if d < min_r:
                     min_r = d
