@@ -57,7 +57,7 @@ class DwaPlannerNode(Node):
 
         # ── Robot / DWA parameters (from reference) ──────────────────────────
         self.max_speed          = 1.0     # [m/s]
-        self.min_speed          = 0.5     # [m/s]  (no reverse)
+        self.min_speed          = 0.0     # [m/s]  allow stop/rotate-in-place
         self.max_omega          = 1.0     # [rad/s]
         self.max_accel          = 0.5     # [m/s²]  higher → faster ramp-up
         self.max_delta_yaw      = 1.0     # [rad/s²]
@@ -65,8 +65,8 @@ class DwaPlannerNode(Node):
         self.dt                 = 0.1     # [s] control timestep
         self.predict_time       = 2.0     # [s] trajectory simulation horizon
         # DWA scoring gains
-        self.to_goal_gain       = 0.15    # heading-error cost weight
-        self.speed_gain         = 2.0     # higher → robot strongly prefers moving
+        self.to_goal_gain       = 1.5     # heading-error cost weight
+        self.speed_gain         = 1.0     # higher → robot strongly prefers moving
         self.obstacle_gain      = 1.0     # obstacle cost weight
         self.robot_stuck_flag   = 0.001   # minimum v/omega to prevent freeze
         # Velocity sampling resolution inside dynamic window
@@ -289,13 +289,15 @@ class DwaPlannerNode(Node):
                     best_v     = v
                     best_omega = omega
 
-        # Anti-freeze: if no valid trajectory, force turn
+        # Anti-freeze: if no valid trajectory, stop and spin
         if best_cost == float('inf'):
             self.get_logger().warn('DWA: all trajectories blocked — forcing turn',
                                    throttle_duration_sec=1.0)
-            best_omega = self.max_delta_yaw * self.dt
+            best_v     = 0.0
+            best_omega = self.max_omega
         elif abs(best_v) < self.robot_stuck_flag and abs(best_omega) < self.robot_stuck_flag:
-            best_omega = self.max_delta_yaw * self.dt
+            best_v     = 0.0
+            best_omega = self.max_omega
 
         self.get_logger().debug(
             f'DWA: v={best_v:.3f} ω={best_omega:.3f}  '
