@@ -177,6 +177,7 @@ class DrNavDWAController(Node):
             return
 
         gx, gy = self.current_goal
+        self.get_logger().info(f"Recieved goal: ({gx:.2f}, {gy:.2f}), robot: ({rx:.2f}, {ry:.2f}, yaw={ryaw:.2f}), state: {self.nav_state}, consecutive_blocked: {self.consecutive_blocked}, stuck_count: {self.stuck_count}")
         dist_to_goal = math.hypot(gx - rx, gy - ry)
 
         # Halted at recovery point — observe for halt_duration_ticks then resume
