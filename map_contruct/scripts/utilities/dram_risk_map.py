@@ -82,7 +82,7 @@ class DRaMRiskMap(Node):
         # grid_pos (int, int) → {'safety': float, 'timestamp': float}
         self.explored_grid = {}
         self.grid_resolution = 0.3        # metres per cell
-        self.exploration_radius = 3.0     # metres around robot to update
+        self.exploration_radius = 1.0     # metres around robot to update
 
         # ── Sector visualisation parameters ──────────────────────────────
         self.sector_radius = 3.0
@@ -358,8 +358,8 @@ class DRaMRiskMap(Node):
             hm.id = marker_id
             hm.type = Marker.POINTS
             hm.action = Marker.ADD
-            hm.scale.x = self.grid_resolution * 1.5
-            hm.scale.y = self.grid_resolution * 1.5
+            hm.scale.x = self.grid_resolution
+            hm.scale.y = self.grid_resolution
             hm.pose.orientation.w = 1.0
             hm.lifetime.sec = 0  # persistent
 
@@ -374,10 +374,10 @@ class DRaMRiskMap(Node):
 
                 safety = data['safety']
                 c = ColorRGBA()
-                c.r = 0.0 if safety >= 0.5 else 1.0
-                c.g = 1.0 if safety >= 0.5 else 0.0
-                c.b = 0.0
-                c.a = 0.9
+                c.r = 1.0                               # white (safe) or orange (dead end)
+                c.g = 1.0 if safety >= 0.5 else 0.5    # white=1.0, orange=0.5
+                c.b = 1.0 if safety >= 0.5 else 0.0    # white=1.0, orange=0.0
+                c.a = 0.85 if safety >= 0.5 else 0.55  # dead ends semi-transparent
                 hm.colors.append(c)
 
             if hm.points:
@@ -392,21 +392,16 @@ class DRaMRiskMap(Node):
             pin.header.stamp = self.get_clock().now().to_msg()
             pin.ns = 'recovery_pins'
             pin.id = marker_id
-            pin.type = Marker.CYLINDER
+            pin.type = Marker.CUBE
             pin.action = Marker.ADD
             pin.pose.position.x = rp.x
             pin.pose.position.y = rp.y
             pin.pose.position.z = 0.1
             pin.pose.orientation.w = 1.0
-            pin.scale.x = pin.scale.y = 0.3
-            pin.scale.z = 0.2
-            # colour by rank: purple=3, dark blue=2, light blue=1
-            if rp.rank >= 3:
-                pin.color.r, pin.color.g, pin.color.b = 0.5, 0.0, 1.0
-            elif rp.rank == 2:
-                pin.color.r, pin.color.g, pin.color.b = 0.0, 0.0, 0.8
-            else:
-                pin.color.r, pin.color.g, pin.color.b = 0.3, 0.6, 1.0
+            pin.scale.x = pin.scale.y = 0.5
+            pin.scale.z = 0.05
+            # solid blue for all recovery points
+            pin.color.r, pin.color.g, pin.color.b = 0.0, 0.4, 1.0
             pin.color.a = 0.9
             pin.lifetime.sec = 0
             marker_array.markers.append(pin)

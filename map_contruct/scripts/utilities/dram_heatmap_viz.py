@@ -92,21 +92,20 @@ class DRaMExplorationMap(Node):
         self.get_logger().info('DRaM Exploration Map initialized - GREEN for safe paths, RED only when dead ends detected')
 
     def get_safety_color(self, safety_level):
-        """Get RGB color for safety level: only show green for safe areas, red only for actual dead ends"""
-        # Only show colors when there's a clear prediction
-        if safety_level >= 0.5:  # Safe/open path detected
-            return (0.0, 1.0, 0.0)  # Pure bright green
-        else:  # Dead end detected
-            return (1.0, 0.0, 0.0)  # Pure bright red (only when dead end is predicted)
+        """Get RGB color: white for explored/safe, red for dead ends/unexplored"""
+        if safety_level >= 0.5:  # Explored safe area
+            return (1.0, 1.0, 1.0)  # White
+        else:  # Dead end / unexplored danger
+            return (1.0, 0.0, 0.0)  # Red
 
     def get_recovery_point_color(self, open_paths):
-        """Get color for recovery points based on number of open paths"""
+        """Recovery points are always solid blue (safe escape routes)"""
         if open_paths >= 3:  # 3 sides open
-            return (0.5, 0.0, 1.0)  # Purple
+            return (0.0, 0.4, 1.0)  # Blue
         elif open_paths >= 2:  # 2 sides open
-            return (0.0, 0.0, 0.8)  # Dark blue
+            return (0.0, 0.4, 1.0)  # Blue
         else:  # 1 side open
-            return (0.3, 0.6, 1.0)  # Light blue
+            return (0.0, 0.4, 1.0)  # Blue
 
     def get_robot_position(self):
         """Get current robot position"""
@@ -380,8 +379,8 @@ class DRaMExplorationMap(Node):
             heatmap_marker.action = Marker.ADD
             
             # Set point size for clear visibility
-            heatmap_marker.scale.x = self.grid_resolution * 1.5  # Point width - larger for better visibility
-            heatmap_marker.scale.y = self.grid_resolution * 1.5  # Point height
+            heatmap_marker.scale.x = self.grid_resolution * 1.2  # Point width - larger for better visibility
+            heatmap_marker.scale.y = self.grid_resolution * 1.2  # Point height
             heatmap_marker.scale.z = 0.03  # Point thickness - slightly thicker
             
             heatmap_marker.pose.orientation.w = 1.0
@@ -408,7 +407,7 @@ class DRaMExplorationMap(Node):
                 color.r = r
                 color.g = g
                 color.b = b
-                color.a = 0.9  # High visibility for clear predictions
+                color.a = 0.5  # High visibility for clear predictions
                 heatmap_marker.colors.append(color)
             
             # Only add marker if we have points to show
@@ -417,27 +416,26 @@ class DRaMExplorationMap(Node):
                 marker_array.markers.append(heatmap_marker)
             marker_id += 1
 
-        # 2. Add recovery points as pins with text labels
+        # 2. Add recovery points as flat tiles on the ground
         for i, rp in enumerate(self.recovery_points):
-            # Create pin marker (CYLINDER)
             pin_marker = Marker()
             pin_marker.header.frame_id = frame_id
             pin_marker.header.stamp = self.get_clock().now().to_msg()
             pin_marker.ns = "recovery_pins"
             pin_marker.id = marker_id
-            pin_marker.type = Marker.CYLINDER
+            pin_marker.type = Marker.CUBE
             pin_marker.action = Marker.ADD
-            
-            # Position the pin
+
+            # Position flat on the ground
             pin_marker.pose.position.x = rp['x']
             pin_marker.pose.position.y = rp['y']
-            pin_marker.pose.position.z = 0.1  # Height of pin
+            pin_marker.pose.position.z = 0.01  # Just above ground
             pin_marker.pose.orientation.w = 1.0
-            
-            # Size of pin
-            pin_marker.scale.x = 0.3  # Width
-            pin_marker.scale.y = 0.3  # Depth
-            pin_marker.scale.z = 0.2  # Height
+
+            # Flat tile: wide XY, thin Z
+            pin_marker.scale.x = 0.5  # Width
+            pin_marker.scale.y = 0.5  # Depth
+            pin_marker.scale.z = 0.02  # Very thin (tile)
             
             # Color based on open paths
             r, g, b = self.get_recovery_point_color(rp['open_paths'])
@@ -459,28 +457,28 @@ class DRaMExplorationMap(Node):
             text_marker.type = Marker.TEXT_VIEW_FACING
             text_marker.action = Marker.ADD
             
-            # Position text above the pin
-            text_marker.pose.position.x = rp['x']
-            text_marker.pose.position.y = rp['y']
-            text_marker.pose.position.z = 0.3  # Above the pin
-            text_marker.pose.orientation.w = 1.0
+            # # Position text above the pin
+            # text_marker.pose.position.x = rp['x']
+            # text_marker.pose.position.y = rp['y']
+            # text_marker.pose.position.z = 0.3  # Above the pin
+            # text_marker.pose.orientation.w = 1.0
             
-            # Text content
-            open_paths = rp['open_paths']
-            text_marker.text = f"{open_paths} open"
+            # # Text content
+            # open_paths = rp['open_paths']
+            # text_marker.text = f"{open_paths} open"
             
-            # Text size
-            text_marker.scale.z = 0.15  # Text height
+            # # Text size
+            # text_marker.scale.z = 0.15  # Text height
             
-            # Text color (white for visibility)
-            text_marker.color.r = 1.0
-            text_marker.color.g = 1.0
-            text_marker.color.b = 1.0
-            text_marker.color.a = 1.0
+            # # Text color (white for visibility)
+            # text_marker.color.r = 1.0
+            # text_marker.color.g = 1.0
+            # text_marker.color.b = 1.0
+            # text_marker.color.a = 1.0
             
-            text_marker.lifetime.sec = 0  # Persistent
-            marker_array.markers.append(text_marker)
-            marker_id += 1
+            # text_marker.lifetime.sec = 0  # Persistent
+            # marker_array.markers.append(text_marker)
+            # marker_id += 1
 
         # Publish exploration map
         self.risk_map_pub.publish(marker_array)
