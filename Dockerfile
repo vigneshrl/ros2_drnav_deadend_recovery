@@ -25,8 +25,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-tf2-sensor-msgs \
     ros-humble-nav2-msgs \
     ros-humble-sensor-msgs-py \
+    ros-humble-pointcloud-to-laserscan \
     python3-colcon-common-extensions \
     python3-pip \
+    nano vim \
     && rm -rf /var/lib/apt/lists/*
 
 # ── 2. Python ML packages ─────────────────────────────────────────────────────
@@ -36,7 +38,7 @@ RUN pip3 install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cu118
 
 RUN pip3 install --no-cache-dir \
-    numpy \
+    "numpy<2" \
     opencv-python-headless \
     Pillow \
     matplotlib \

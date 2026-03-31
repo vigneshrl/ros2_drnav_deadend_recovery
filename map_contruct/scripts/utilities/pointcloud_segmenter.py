@@ -2,10 +2,9 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2
 import sensor_msgs_py.point_cloud2 as pc2
-# from rclpy.qos import QoSProfile, ReliabilityPolicy
-# from sensor_msgs.msg import PointCloud2, PointField
 import numpy as np
 from std_msgs.msg import Header
 
@@ -19,7 +18,7 @@ class PointCloudSegmenter(Node):
         # Subscribe to main point cloud
         self.subscription = self.create_subscription(
             PointCloud2,
-            '/os_cloud_node/points',
+            '/j100_0893/sensors/lidar3d_0/points', #change the topic as per your robtos namespace
             self.pointcloud_callback,
             10
         )

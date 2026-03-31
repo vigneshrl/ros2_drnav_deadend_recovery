@@ -107,9 +107,9 @@ class DrNavDWAController(Node):
         self.create_subscription(Float32MultiArray,
                                  '/dead_end_detection/recovery_points',
                                  self._recovery_points_cb, 10)
-        self.create_subscription(LaserScan, '/scan', self._scan_cb, 10)
+        self.create_subscription(LaserScan, '/j100_0893/scan', self._scan_cb, 10)
 
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.cmd_pub = self.create_publisher(Twist, '/j100_0893/platform/cmd_vel_unstamped', 10)
         self.create_timer(0.1, self._control_loop)
 
         self.get_logger().info('DR.Nav DWA Controller initialized')

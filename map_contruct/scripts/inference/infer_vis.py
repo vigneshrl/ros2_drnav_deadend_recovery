@@ -126,7 +126,7 @@ class DeadEndDetectionNodeWithVisualization(Node):
             lidar_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
         self.front_cam_sub = self.create_subscription(
-            Image, '/argus/ar0234_front_left/image_raw', self.front_cam_callback, cam_qos)
+            Image, '/j100_0893/sensors/camera_0/camera_0/left_raw/image_raw_color', self.front_cam_callback, cam_qos)
         self.front_lidar_sub = self.create_subscription(
             PointCloud2, '/lidar/front/points', self.front_lidar_callback, lidar_qos)
 
