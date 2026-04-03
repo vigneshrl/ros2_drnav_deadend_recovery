@@ -36,7 +36,7 @@ class DeadEndDetectionNodeWithVisualization(Node):
         # ADD: Robot mode flag to disable heavy processing
         self.robot_mode = self.declare_parameter('robot_mode', True).get_parameter_value().bool_value
         self.save_visualizations = self.declare_parameter('save_visualizations', False).get_parameter_value().bool_value
-        self.single_camera = self.declare_parameter('single_camera', False).get_parameter_value().bool_value
+        self.single_camera = self.declare_parameter('single_camera', True).get_parameter_value().bool_value
         
         # Visualization and saving setup (only if needed)
         if self.save_visualizations:
@@ -456,8 +456,12 @@ class DeadEndDetectionNodeWithVisualization(Node):
             
             # Prepare LiDAR tensors
             front_lidar = self.front_lidar.unsqueeze(0).to(self.device)
-            left_lidar = self.left_lidar.unsqueeze(0).to(self.device)
-            right_lidar = self.right_lidar.unsqueeze(0).to(self.device)
+            if self.single_camera:
+                left_lidar = None
+                right_lidar = None
+            else:
+                left_lidar = self.left_lidar.unsqueeze(0).to(self.device)
+                right_lidar = self.right_lidar.unsqueeze(0).to(self.device)            
             
             tensor_prep_time = time.time() - tensor_prep_start
             self.timing_breakdown['tensor_preparation'].append(tensor_prep_time)
