@@ -55,6 +55,8 @@ This builds a container with ROS 2 Humble, PyTorch (CUDA 11.8), and the full wor
 ```bash
 docker run --rm -it --gpus all \
   --network host --ipc host \
+  -e FASTDDS_BUILTIN_TRANSPORTS=UDPv4 \
+  -e RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
   --name drnav \
   -v /path/to/your/model_wts:/model_wts \
   drnav bash
@@ -99,6 +101,8 @@ If you edit code on the host and want the container to reflect it, you have two 
 ```bash
 docker run --rm -it --gpus all \
   --network host --ipc host \
+  -e FASTDDS_BUILTIN_TRANSPORTS=UDPv4 \
+  -e RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
   --name drnav \
   -v /path/to/your/model_wts:/model_wts \
   -v /path/to/ros2_drnav_deadend_recovery:/ros2_ws/src/map_contruct \
