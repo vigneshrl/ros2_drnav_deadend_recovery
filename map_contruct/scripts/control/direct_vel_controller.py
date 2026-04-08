@@ -29,6 +29,7 @@ import math
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import OccupancyGrid, Path
 from sensor_msgs.msg import LaserScan
@@ -94,6 +95,9 @@ class DrNavDWAController(Node):
         self.tf_buffer   = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
+        # Match Qos
+        lidar_qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
+                         durability=DurabilityPolicy.VOLATILE, reliability=ReliabilityPolicy.BEST_EFFORT)
         # Subscribers
         # self.create_subscription(Path,             '/global_path',
         #                          self._path_cb,            10)
@@ -107,7 +111,7 @@ class DrNavDWAController(Node):
         self.create_subscription(Float32MultiArray,
                                  '/dead_end_detection/recovery_points',
                                  self._recovery_points_cb, 10)
-        self.create_subscription(LaserScan, '/j100_0893/scan', self._scan_cb, 10)
+        self.create_subscription(LaserScan, '/j100_0893/scan', self._scan_cb, lidar_qos)
 
         self.cmd_pub = self.create_publisher(Twist, '/j100_0893/platform/cmd_vel_unstamped', 10)
         self.create_timer(0.1, self._control_loop)

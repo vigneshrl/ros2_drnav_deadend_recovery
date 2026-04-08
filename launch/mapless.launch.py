@@ -132,17 +132,25 @@ def launch_setup(context, *args, **kwargs):
     # Goal:             from RViz2 /move_base_simple/goal
 
     elif method == 'dram':
-        nodes.append(Node(
-            package='map_contruct',
-            executable='global_planner',
-            name='global_planner',
-            output='screen',
-        ))
+        # nodes.append(Node(
+        #     package='map_contruct',
+        #     executable='global_planner',
+        #     name='global_planner',
+        #     output='screen',
+        #     remappings=[
+        #     ('/tf', '/j100_0893/tf'),
+        #     ('/tf_static', '/j100_0893/tf_static'),
+        # ],
+        # ))
         nodes.append(Node(
             package='map_contruct',
             executable='pointcloud_segmenter',
             name='pointcloud_segmenter',
             output='screen',
+            remappings=[
+            ('/tf', '/j100_0893/tf'),
+            ('/tf_static', '/j100_0893/tf_static'),
+        ],
         ))
         nodes.append(Node(
             package='map_contruct',
@@ -154,18 +162,30 @@ def launch_setup(context, *args, **kwargs):
                 'save_visualizations': False,
                 'model_path':          model_path,
             }],
+            remappings=[
+            ('/tf', '/j100_0893/tf'),
+            ('/tf_static', '/j100_0893/tf_static'),
+        ],
         ))
         nodes.append(Node(
             package='map_contruct',
             executable='dram_risk_map',
             name='dram_risk_map',
             output='screen',
+            remappings=[
+            ('/tf', '/j100_0893/tf'),
+            ('/tf_static', '/j100_0893/tf_static'),
+        ],
         ))
         nodes.append(Node(
             package='map_contruct',
             executable='direct_vel_controller',
             name='direct_vel_controller',
             output='screen',
+            remappings=[
+            ('/tf', '/j100_0893/tf'),
+            ('/tf_static', '/j100_0893/tf_static'),
+        ],
         ))
 
     # ── Optional: RViz ──────────────────────────────────────────────────────
