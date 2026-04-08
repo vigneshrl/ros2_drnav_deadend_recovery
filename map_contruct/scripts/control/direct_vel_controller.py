@@ -137,9 +137,12 @@ class DrNavDWAController(Node):
         self.dram_costmap = msg
 
     def _path_status_cb(self, msg: Float32MultiArray):
-        if len(msg.data) < 3 or self.nav_state != 'navigating':
+        if len(msg.data) < 1 or self.nav_state != 'navigating':
             return
-        F, L, R = msg.data[0], msg.data[1], msg.data[2]
+        if len(msg.data) >= 3:
+            F, L, R = msg.data[0], msg.data[1], msg.data[2]
+        else:
+            F = L = R = msg.data[0]
         all_blocked = (F < self.blocked_thr and
                        L < self.blocked_thr and
                        R < self.blocked_thr)

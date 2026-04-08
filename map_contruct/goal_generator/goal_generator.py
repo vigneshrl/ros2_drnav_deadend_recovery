@@ -220,13 +220,20 @@ class GoalGenerator(Node):
 
     def path_status_callback(self, msg: Float32MultiArray):
         """Process path status for intelligent recovery triggering"""
+        if len(msg.data) < 1:
+            return
+
         if len(msg.data) >= 3:
-            self.current_path_status = [msg.data[0], msg.data[1], msg.data[2]]  # [front, left, right]
-            
-            # Check if ALL 3 directions are blocked (below threshold)
-            front_blocked = msg.data[0] < self.path_blocked_threshold
-            left_blocked = msg.data[1] < self.path_blocked_threshold
-            right_blocked = msg.data[2] < self.path_blocked_threshold
+            probs = [msg.data[0], msg.data[1], msg.data[2]]
+        else:
+            probs = [msg.data[0]] * 3
+
+        self.current_path_status = probs
+
+        if True:
+            front_blocked = probs[0] < self.path_blocked_threshold
+            left_blocked = probs[1] < self.path_blocked_threshold
+            right_blocked = probs[2] < self.path_blocked_threshold
             
             self.is_truly_blocked = front_blocked and left_blocked and right_blocked
             

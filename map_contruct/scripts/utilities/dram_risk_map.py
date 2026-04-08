@@ -109,13 +109,18 @@ class DRaMRiskMap(Node):
         self.current_map = msg
 
     def path_status_callback(self, msg: Float32MultiArray):
-        if len(msg.data) < 3:
+        if len(msg.data) < 1:
             return
 
         robot_x, robot_y, robot_yaw, frame_id = self._get_robot_position()
         current_time = time.time()
 
-        probs = list(msg.data[:3])   # [front, left, right]
+        # Support both single-camera (1 value) and multi-camera (3 values)
+        if len(msg.data) >= 3:
+            probs = list(msg.data[:3])
+        else:
+            probs = [msg.data[0]] * 3
+
         path_binary = [1 if p > self.threshold else 0 for p in probs]
         front_open, left_open, right_open = path_binary
         open_count = sum(path_binary)
