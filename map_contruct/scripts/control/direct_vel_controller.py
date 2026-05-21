@@ -43,9 +43,9 @@ class DrNavDWAController(Node):
         super().__init__('dr_nav_dwa_controller')
 
         # ── DWA parameters ───────────────────────────────────────────────────
-        self.max_speed        = 1.0
+        self.max_speed        = 0.1
         self.min_speed        = 0.0
-        self.max_omega        = 1.0
+        self.max_omega        = 0.4
         self.max_accel        = 0.5
         self.max_delta_yaw    = 1.0
         self.dt               = 0.1
@@ -61,10 +61,10 @@ class DrNavDWAController(Node):
         self.penalty_w  = 2.0    # dead-end direction penalty weight
 
         # ── Navigation parameters ────────────────────────────────────────────
-        self.goal_tol        = 0.5
+        self.goal_tol        = 0.15
         self.carrot_dist     = 1.5
-        self.prox_stop_dist  = 0.4
-        self.blocked_thr     = 0.56
+        self.prox_stop_dist  = 0.48
+        self.blocked_thr     = 0.45
         self.consecutive_thr = 5
         self.robot_radius    = 0.5   # inflate obstacle check — increase to make robot more conservative
 
@@ -98,6 +98,8 @@ class DrNavDWAController(Node):
         # Match Qos
         lidar_qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
                          durability=DurabilityPolicy.VOLATILE, reliability=ReliabilityPolicy.BEST_EFFORT)
+        cmd_vel_qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
+                            durability=DurabilityPolicy.VOLATILE, reliability=ReliabilityPolicy.RELIABLE)
         # Subscribers
         # self.create_subscription(Path,             '/global_path',
         #                          self._path_cb,            10)
@@ -113,7 +115,7 @@ class DrNavDWAController(Node):
                                  self._recovery_points_cb, 10)
         self.create_subscription(LaserScan, '/j100_0893/scan', self._scan_cb, lidar_qos)
 
-        self.cmd_pub = self.create_publisher(Twist, '/j100_0893/platform/cmd_vel_unstamped', 10)
+        self.cmd_pub = self.create_publisher(Twist, '/j100_0893/platform/cmd_vel_unstamped', cmd_vel_qos)
         self.create_timer(0.1, self._control_loop)
 
         self.get_logger().info('DR.Nav DWA Controller initialized')
@@ -147,9 +149,9 @@ class DrNavDWAController(Node):
             F, L, R = msg.data[0], msg.data[1], msg.data[2]
         else:
             F = L = R = msg.data[0]
-        all_blocked = (F < self.blocked_thr and
-                       L < self.blocked_thr and
-                       R < self.blocked_thr)
+        all_blocked = (F <= self.blocked_thr and
+                       L <= self.blocked_thr and
+                       R <= self.blocked_thr)
         if all_blocked:
             self.consecutive_blocked += 1
         else:
@@ -181,6 +183,7 @@ class DrNavDWAController(Node):
         # Proximity hard stop
         if self.front_min_range < self.prox_stop_dist:
             self.cmd_pub.publish(Twist())
+            self.get_logger().info('HALLLLLTTTTTTT.')
             return
 
         gx, gy = self.current_goal
@@ -444,7 +447,7 @@ class DrNavDWAController(Node):
     def _get_robot_pose(self):
         try:
             t = self.tf_buffer.lookup_transform(
-                'map', 'base_link', rclpy.time.Time(),
+                'map', '93/base_link', rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.1))
             x     = t.transform.translation.x
             y     = t.transform.translation.y

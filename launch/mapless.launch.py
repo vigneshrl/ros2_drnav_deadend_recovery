@@ -47,6 +47,8 @@ def launch_setup(context, *args, **kwargs):
     record     = LaunchConfiguration('record').perform(context).lower() == 'true'
     run_id     = LaunchConfiguration('run_id').perform(context)
     model_path = LaunchConfiguration('model_path').perform(context)
+    map_frame = LaunchConfiguration('map_frame').perform(context)
+    robot_base_frame = LaunchConfiguration('robot_base_frame').perform(context)
 
     valid = ('dwa', 'mppi', 'nav2_dwb', 'dram')
     if method not in valid:
@@ -132,25 +134,11 @@ def launch_setup(context, *args, **kwargs):
     # Goal:             from RViz2 /move_base_simple/goal
 
     elif method == 'dram':
-        # nodes.append(Node(
-        #     package='map_contruct',
-        #     executable='global_planner',
-        #     name='global_planner',
-        #     output='screen',
-        #     remappings=[
-        #     ('/tf', '/j100_0893/tf'),
-        #     ('/tf_static', '/j100_0893/tf_static'),
-        # ],
-        # ))
         nodes.append(Node(
             package='map_contruct',
             executable='pointcloud_segmenter',
             name='pointcloud_segmenter',
             output='screen',
-            remappings=[
-            ('/tf', '/j100_0893/tf'),
-            ('/tf_static', '/j100_0893/tf_static'),
-        ],
         ))
         nodes.append(Node(
             package='map_contruct',
@@ -162,30 +150,22 @@ def launch_setup(context, *args, **kwargs):
                 'save_visualizations': False,
                 'model_path':          model_path,
             }],
-            remappings=[
-            ('/tf', '/j100_0893/tf'),
-            ('/tf_static', '/j100_0893/tf_static'),
-        ],
         ))
         nodes.append(Node(
             package='map_contruct',
             executable='dram_risk_map',
             name='dram_risk_map',
             output='screen',
-            remappings=[
-            ('/tf', '/j100_0893/tf'),
-            ('/tf_static', '/j100_0893/tf_static'),
-        ],
+            parameters=[{
+                'map_frame': map_frame,
+                'robot_base_frame': robot_base_frame,
+            }],
         ))
         nodes.append(Node(
             package='map_contruct',
             executable='direct_vel_controller',
             name='direct_vel_controller',
             output='screen',
-            remappings=[
-            ('/tf', '/j100_0893/tf'),
-            ('/tf_static', '/j100_0893/tf_static'),
-        ],
         ))
 
     # ── Optional: RViz ──────────────────────────────────────────────────────
@@ -226,6 +206,16 @@ def generate_launch_description():
             'model_path',
             default_value='',
             description='Absolute path to model weights .pth file (required for dram)',
+        ),
+        DeclareLaunchArgument(
+            'map_frame',
+            default_value='map',
+            description='TF global frame for DRaM (e.g. map)',
+        ),
+        DeclareLaunchArgument(
+            'robot_base_frame',
+            default_value='93/base_link',
+            description='TF robot base frame for DRaM (e.g. 93/base_link)',
         ),
         OpaqueFunction(function=launch_setup),
     ])

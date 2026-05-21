@@ -2,7 +2,7 @@
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import Bool, Float32MultiArray
 from geometry_msgs.msg import Point
@@ -122,7 +122,8 @@ class DeadEndDetectionNodeWithVisualization(Node):
             )
         else:
             # ROSBAG MODE: RELIABLE for all
-            cam_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+            cam_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST,
+                         durability=DurabilityPolicy.VOLATILE)
             lidar_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
         self.front_cam_sub = self.create_subscription(
@@ -300,8 +301,8 @@ class DeadEndDetectionNodeWithVisualization(Node):
         vec = direction_vectors[idx]
         prob = float(path_probs[idx])
         
-        # Use correct threshold (0.56) for arrow plotting
-        if prob > 0.54:  # Only plot arrows for open paths
+        # Only plot arrows for open paths.
+        if prob > 0.40:
             direction = np.array([vec[0], vec[2]])  # Use x,z components
             
             if np.linalg.norm(direction) > 0:
@@ -473,7 +474,7 @@ class DeadEndDetectionNodeWithVisualization(Node):
             if self.model is None:
                 if self.single_camera:
                     outputs = {
-                        'path_status': torch.tensor([[0.6]]),
+                        'path_status': torch.tensor([[0.5]]),
                         'is_dead_end': torch.tensor([[0.2]]),
                         'direction_vectors': torch.randn(1, 1, 3) * 0.5
                     }
@@ -527,7 +528,7 @@ class DeadEndDetectionNodeWithVisualization(Node):
             self.total_processed += 1
             
             # Apply correct dead-end logic for results storage
-            threshold = 0.65
+            threshold = 0.40
             if self.single_camera:
                 front_open = path_probs[0] > threshold
                 is_dead_end_correct = not front_open
@@ -578,8 +579,8 @@ class DeadEndDetectionNodeWithVisualization(Node):
 
     def print_frame_status(self, path_probs, is_dead_end, inference_time, total_batch_time):
         """Print comprehensive status for each processed frame"""
-        # Correct dead-end logic: if NO path has >0.56 probability, it's a dead end
-        threshold = 0.56
+        # Correct dead-end logic: if NO path has > threshold probability, it's a dead end.
+        threshold = 0.40
         front_open = path_probs[0] > threshold
         left_open = path_probs[1] > threshold  
         right_open = path_probs[2] > threshold
@@ -618,7 +619,7 @@ class DeadEndDetectionNodeWithVisualization(Node):
             
         try:
             # Apply correct dead-end logic (same as print_frame_status)
-            threshold = 0.56
+            threshold = 0.4
             front_open = path_probs[0] > threshold
             left_open = path_probs[1] > threshold  
             right_open = path_probs[2] > threshold
@@ -679,7 +680,7 @@ class DeadEndDetectionNodeWithVisualization(Node):
                 'total_frames': self.total_processed,
                 'avg_inference_time': float(np.mean(self.processing_times)) if self.processing_times else 0,
                 'avg_fps': float(1.0 / np.mean(self.processing_times)) if self.processing_times else 0,
-                'threshold_used': 0.56,
+                'threshold_used': 0.40,
                 'dead_end_rate': float(np.mean([r['is_dead_end'] for r in self.results_history])) if self.results_history else 0,
                 'avg_open_paths_per_frame': float(np.mean([r['open_paths_count'] for r in self.results_history])) if self.results_history else 0,
                 'open_path_rates': {
@@ -727,7 +728,7 @@ class DeadEndDetectionNodeWithVisualization(Node):
         """Publish model outputs: path_status and is_dead_end"""
         path_probs = outputs['path_status'].cpu().numpy().flatten()
 
-        threshold = 0.56
+        threshold = 0.40
         if self.single_camera:
             is_dead_end = path_probs[0] <= threshold
         else:

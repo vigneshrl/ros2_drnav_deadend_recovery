@@ -12,6 +12,11 @@ class PointCloudSegmenter(Node):
     def __init__(self):
         super().__init__('pointcloud_segmenter')
 
+        self.range_min = 0.45
+        self.range_max = 4.0
+        self.min_height = 0.0
+        self.max_height = 1.0
+
         # BEST_EFFORT matches Isaac Sim and real Ouster driver QoS
         qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
     durability=DurabilityPolicy.VOLATILE, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -43,9 +48,16 @@ class PointCloudSegmenter(Node):
             if points.shape[0] == 0:
                 return
             angles = np.arctan2(points[:, 1], points[:, 0])
-            front_mask = (angles >= -0.524) & (angles <= 0.524)
-            right_mask = (angles >= -2.094) & (angles <= -1.047)
-            left_mask = (angles >= 1.047) & (angles <= 2.094)
+            ranges = np.hypot(points[:, 0], points[:, 1])
+            valid_mask = (
+                (ranges > self.range_min) &
+                (ranges < self.range_max) &
+                (points[:, 2] >= self.min_height) &
+                (points[:, 2] <= self.max_height)
+            )
+            front_mask = (angles >= -0.524) & (angles <= 0.524) & valid_mask
+            right_mask = (angles >= -2.094) & (angles <= -1.047) & valid_mask
+            left_mask = (angles >= 1.047) & (angles <= 2.094) & valid_mask
             self.publish_cloud(self.front_pub, points[front_mask], msg.header)
             self.publish_cloud(self.left_pub, points[left_mask], msg.header)
             self.publish_cloud(self.right_pub, points[right_mask], msg.header)
