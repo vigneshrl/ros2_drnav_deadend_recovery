@@ -166,6 +166,10 @@ def launch_setup(context, *args, **kwargs):
             executable='direct_vel_controller',
             name='direct_vel_controller',
             output='screen',
+            parameters=[{
+                'map_frame': map_frame,
+                'robot_base_frame': robot_base_frame,
+            }],
         ))
 
     # ── Optional: RViz ──────────────────────────────────────────────────────

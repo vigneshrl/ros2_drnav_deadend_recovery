@@ -117,7 +117,7 @@ class DRaMRiskMap(Node):
             self.declare_parameter('calibration_sample_count', 30).value
         )
         self.calibration_drop_threshold = float(
-            self.declare_parameter('calibration_drop_threshold', 0.03).value
+            self.declare_parameter('calibration_drop_threshold', 0.05).value
         )
         self.calibration_samples = []
         self.baseline_prob = None

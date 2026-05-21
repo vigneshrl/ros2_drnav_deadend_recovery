@@ -42,6 +42,12 @@ class DrNavDWAController(Node):
     def __init__(self):
         super().__init__('dr_nav_dwa_controller')
 
+        # ── Frame parameters ─────────────────────────────────────────────────
+        self.map_frame = str(self.declare_parameter('map_frame', 'map').value)
+        self.robot_base_frame = str(
+            self.declare_parameter('robot_base_frame', '93/base_link').value
+        )
+
         # ── DWA parameters ───────────────────────────────────────────────────
         self.max_speed        = 0.1
         self.min_speed        = 0.0
@@ -70,7 +76,7 @@ class DrNavDWAController(Node):
 
         # Stuck detection — triggers recovery subgoal if robot doesn't progress
         self.stuck_check_steps = 20    # check every 20 ticks (~2 s at 10 Hz)
-        self.stuck_dist_thr    = 0.15  # must move at least 15 cm per check interval
+        self.stuck_dist_thr    = 0.05  # must move at least 5 cm per check interval
         self.stuck_thr         = 3     # consecutive stuck checks before recovery
         self.stuck_count       = 0
         self.stuck_tick        = 0
@@ -90,6 +96,7 @@ class DrNavDWAController(Node):
         self.current_v           = 0.0
         self.current_omega       = 0.0
         self.front_min_range     = 999.0
+        self._last_tf_warn_time  = 0.0
 
         # TF
         self.tf_buffer   = Buffer()
@@ -105,6 +112,8 @@ class DrNavDWAController(Node):
         #                          self._path_cb,            10)
         self.create_subscription(PoseStamped,      '/goal_pose',
                                  self._goal_cb,            10)
+        self.create_subscription(PoseStamped,      '/move_base_simple/goal',
+                                 self._goal_cb,            10)
         self.create_subscription(OccupancyGrid,    '/local_costmap',
                                  self._costmap_cb,         10)
         self.create_subscription(Float32MultiArray,
@@ -118,7 +127,10 @@ class DrNavDWAController(Node):
         self.cmd_pub = self.create_publisher(Twist, '/j100_0893/platform/cmd_vel_unstamped', cmd_vel_qos)
         self.create_timer(0.1, self._control_loop)
 
-        self.get_logger().info('DR.Nav DWA Controller initialized')
+        self.get_logger().info(
+            f'DR.Nav DWA Controller initialized '
+            f'(map_frame={self.map_frame}, robot_base_frame={self.robot_base_frame})'
+        )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -127,7 +139,11 @@ class DrNavDWAController(Node):
     #                         for p in msg.poses]
 
     def _goal_cb(self, msg: PoseStamped):
-        self.current_goal        = (msg.pose.position.x, msg.pose.position.y)
+        goal = self._goal_to_map(msg)
+        if goal is None:
+            return
+
+        self.current_goal        = goal
         self.original_goal       = None
         self.nav_state           = 'navigating'
         self.consecutive_blocked = 0
@@ -136,8 +152,11 @@ class DrNavDWAController(Node):
         self.stuck_count         = 0
         self.stuck_tick          = 0
         self.stuck_ref_pos       = None
+        self.current_v           = 0.0
+        self.current_omega       = 0.0
         self.get_logger().info(
-            f'Goal: ({self.current_goal[0]:.2f}, {self.current_goal[1]:.2f})')
+            f'Goal ({self.map_frame}): '
+            f'({self.current_goal[0]:.2f}, {self.current_goal[1]:.2f})')
 
     def _costmap_cb(self, msg: OccupancyGrid):
         self.dram_costmap = msg
@@ -178,21 +197,35 @@ class DrNavDWAController(Node):
         rx, ry, ryaw, ok = self._get_robot_pose()
         if not ok or self.current_goal is None:
             self.cmd_pub.publish(Twist())
+            self.current_v = 0.0
+            self.current_omega = 0.0
             return
 
         # Proximity hard stop
         if self.front_min_range < self.prox_stop_dist:
             self.cmd_pub.publish(Twist())
-            self.get_logger().info('HALLLLLTTTTTTT.')
+            self.current_v = 0.0
+            self.current_omega = 0.0
+            self.get_logger().warn(
+                f'PROX STOP: front={self.front_min_range:.2f} m '
+                f'< {self.prox_stop_dist:.2f} m',
+                throttle_duration_sec=1.0)
             return
 
         gx, gy = self.current_goal
-        self.get_logger().info(f"Recieved goal: ({gx:.2f}, {gy:.2f}), robot: ({rx:.2f}, {ry:.2f}, yaw={ryaw:.2f}), state: {self.nav_state}, consecutive_blocked: {self.consecutive_blocked}, stuck_count: {self.stuck_count}")
+        self.get_logger().info(
+            f'Received goal: ({gx:.2f}, {gy:.2f}), robot: '
+            f'({rx:.2f}, {ry:.2f}, yaw={ryaw:.2f}), state: {self.nav_state}, '
+            f'consecutive_blocked: {self.consecutive_blocked}, '
+            f'stuck_count: {self.stuck_count}',
+            throttle_duration_sec=1.0)
         dist_to_goal = math.hypot(gx - rx, gy - ry)
 
         # Halted at recovery point — observe for halt_duration_ticks then resume
         if self.nav_state == 'halted':
             self.cmd_pub.publish(Twist())
+            self.current_v = 0.0
+            self.current_omega = 0.0
             self.halt_ticks -= 1
             if self.halt_ticks <= 0:
                 self.get_logger().info('Halt complete. Resuming toward original goal.')
@@ -216,6 +249,8 @@ class DrNavDWAController(Node):
                 self.current_goal = None
                 self.dead_end_yaw = None
             self.cmd_pub.publish(Twist())
+            self.current_v = 0.0
+            self.current_omega = 0.0
             return
 
         # Stuck detection — check every stuck_check_steps ticks
@@ -297,20 +332,18 @@ class DrNavDWAController(Node):
                     continue
 
                 obs_cost = self._obstacle_cost(traj)
-                if obs_cost >= 1.0:          # fully blocked — skip
-                    continue
 
                 goal_cost    = self._heading_cost(traj, carrot)
                 to_goal_cost = self._to_goal_cost(traj, carrot)
                 speed_cost   = self.max_speed - traj[-1, 3]
 
-                # Dead-end direction penalty (already bounded in [0, penalty_w])
+                # Dead-end direction penalty, bounded in [0, 1].
                 penalty = 0.0
                 if self.dead_end_yaw is not None:
                     delta = math.atan2(
                         math.sin(traj[-1, 2] - self.dead_end_yaw),
                         math.cos(traj[-1, 2] - self.dead_end_yaw))
-                    penalty = self.penalty_w * max(0.0, math.cos(delta))
+                    penalty = max(0.0, math.cos(delta))
 
                 trajectories.append({
                     'v': v, 'om': omega,
@@ -319,31 +352,24 @@ class DrNavDWAController(Node):
                     'pen': penalty,
                 })
 
-        # Anti-freeze: if no valid trajectory found, rotate in place
+        # If sampling somehow fails, stop instead of spinning.
         if not trajectories:
-            self.get_logger().warn('DR.Nav DWA: all blocked — spinning',
+            self.get_logger().warn('DR.Nav DWA: no trajectories sampled',
                                    throttle_duration_sec=1.0)
-            return 0.0, self.max_omega * 0.5
-
-        # ── 2. Normalise each cost term across valid trajectories ─────────────
-        # Divide by sum so each term contributes in [0,1] range before weighting.
-        # Penalty is already bounded by penalty_w so normalise it separately.
-        sum_g   = sum(t['g']   for t in trajectories) or 1.0
-        sum_tg  = sum(t['tg']  for t in trajectories) or 1.0
-        sum_ob  = sum(t['ob']  for t in trajectories) or 1.0
-        sum_s   = sum(t['s']   for t in trajectories) or 1.0
-        sum_pen = sum(t['pen'] for t in trajectories) or 1.0
+            return 0.0, 0.0
 
         # ── 3. Score and pick best ────────────────────────────────────────────
         best_score = float('inf')
         best_v, best_omega = 0.0, 0.0
 
         for t in trajectories:
-            score = (self.w_heading * (t['g']   / sum_g)   +
-                     self.w_to_goal * (t['tg']  / sum_tg)  +
-                     self.w_dist    * (t['ob']  / sum_ob)  +
-                     self.w_vel     * (t['s']   / sum_s)   +
-                     self.penalty_w * (t['pen'] / sum_pen))
+            heading_cost = min(t['g'] / math.pi, 1.0)
+            speed_cost = t['s'] / self.max_speed if self.max_speed > 0.0 else 0.0
+            score = (self.w_heading * heading_cost +
+                     self.w_to_goal * t['tg'] +
+                     self.w_dist    * t['ob'] +
+                     self.w_vel     * speed_cost +
+                     self.penalty_w * t['pen'])
             if score < best_score:
                 best_score = score
                 best_v, best_omega = t['v'], t['om']
@@ -447,16 +473,54 @@ class DrNavDWAController(Node):
     def _get_robot_pose(self):
         try:
             t = self.tf_buffer.lookup_transform(
-                'map', '93/base_link', rclpy.time.Time(),
+                self.map_frame, self.robot_base_frame, rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.1))
             x     = t.transform.translation.x
             y     = t.transform.translation.y
-            qz    = t.transform.rotation.z
-            qw    = t.transform.rotation.w
-            theta = 2.0 * math.atan2(qz, qw)
+            theta = self._yaw_from_quat(t.transform.rotation)
             return x, y, theta, True
-        except Exception:
+        except Exception as exc:
+            self._warn_tf(
+                f'Failed TF lookup {self.map_frame} -> '
+                f'{self.robot_base_frame}: {exc}'
+            )
             return 0.0, 0.0, 0.0, False
+
+    def _goal_to_map(self, msg: PoseStamped):
+        src_frame = msg.header.frame_id.strip() if msg.header.frame_id else ''
+        x = msg.pose.position.x
+        y = msg.pose.position.y
+
+        if src_frame == '' or src_frame == self.map_frame:
+            return x, y
+
+        try:
+            t = self.tf_buffer.lookup_transform(
+                self.map_frame, src_frame, rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.2))
+            yaw = self._yaw_from_quat(t.transform.rotation)
+            c = math.cos(yaw)
+            s = math.sin(yaw)
+            tx = t.transform.translation.x
+            ty = t.transform.translation.y
+            return tx + c * x - s * y, ty + s * x + c * y
+        except Exception as exc:
+            self._warn_tf(
+                f'Ignoring goal in frame {src_frame}: failed transform to '
+                f'{self.map_frame}: {exc}'
+            )
+            return None
+
+    def _yaw_from_quat(self, q):
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    def _warn_tf(self, text):
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._last_tf_warn_time > 2.0:
+            self.get_logger().warn(text)
+            self._last_tf_warn_time = now
 
 
 def main(args=None):
