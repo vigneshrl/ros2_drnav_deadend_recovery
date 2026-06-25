@@ -2,7 +2,7 @@
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import Bool, Float32MultiArray
 from geometry_msgs.msg import Point
@@ -36,6 +36,7 @@ class DeadEndDetectionNodeWithVisualization(Node):
         # ADD: Robot mode flag to disable heavy processing
         self.robot_mode = self.declare_parameter('robot_mode', True).get_parameter_value().bool_value
         self.save_visualizations = self.declare_parameter('save_visualizations', False).get_parameter_value().bool_value
+        self.single_camera = self.declare_parameter('single_camera', True).get_parameter_value().bool_value
         
         # Visualization and saving setup (only if needed)
         if self.save_visualizations:
@@ -121,21 +122,24 @@ class DeadEndDetectionNodeWithVisualization(Node):
             )
         else:
             # ROSBAG MODE: RELIABLE for all
-            cam_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+            cam_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST,
+                         durability=DurabilityPolicy.VOLATILE)
             lidar_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
         self.front_cam_sub = self.create_subscription(
-            Image, '/argus/ar0234_front_left/image_raw', self.front_cam_callback, cam_qos)
-        self.left_cam_sub = self.create_subscription(
-            Image, '/argus/ar0234_side_left/image_raw', self.left_cam_callback, cam_qos)
-        self.right_cam_sub = self.create_subscription(
-            Image, '/argus/ar0234_side_right/image_raw', self.right_cam_callback, cam_qos)
+            Image, '/j100_0893/sensors/camera_0/camera_0/left_raw/image_raw_color', self.front_cam_callback, cam_qos)
         self.front_lidar_sub = self.create_subscription(
             PointCloud2, '/lidar/front/points', self.front_lidar_callback, lidar_qos)
-        self.left_lidar_sub = self.create_subscription(
-            PointCloud2, '/lidar/left/points', self.left_lidar_callback, lidar_qos)
-        self.right_lidar_sub = self.create_subscription(
-            PointCloud2, '/lidar/right/points', self.right_lidar_callback, lidar_qos)
+
+        if not self.single_camera:
+            self.left_cam_sub = self.create_subscription(
+                Image, '/argus/ar0234_side_left/image_raw', self.left_cam_callback, cam_qos)
+            self.right_cam_sub = self.create_subscription(
+                Image, '/argus/ar0234_side_right/image_raw', self.right_cam_callback, cam_qos)
+            self.left_lidar_sub = self.create_subscription(
+                PointCloud2, '/lidar/left/points', self.left_lidar_callback, lidar_qos)
+            self.right_lidar_sub = self.create_subscription(
+                PointCloud2, '/lidar/right/points', self.right_lidar_callback, lidar_qos)
         
         # Initialize publishers
         self.dead_end_pub = self.create_publisher(Bool, '/dead_end_detection/is_dead_end', 10)
@@ -159,9 +163,9 @@ class DeadEndDetectionNodeWithVisualization(Node):
         self.get_logger().info('🚀 Dead End Detection Node with Visualization initialized')
         if hasattr(self, 'output_dir'):
             self.get_logger().info(f'📁 Output directory: {self.output_dir}')
-        self.get_logger().info(f'🤖 Robot mode: {self.robot_mode}, Save visualizations: {self.save_visualizations}')
-        self.get_logger().info(f'⏱  Processing interval: {self.processing_interval:.3f}s  (~{1.0/self.processing_interval:.1f} Hz)')
-        self.get_logger().info(f'⚡ Processing interval: {self.processing_interval}s ({1.0/self.processing_interval:.1f} Hz)')
+        self.get_logger().info(f'🤖 Robot mode: {self.robot_mode}, Save visualizations: {self.save_visualizations}, Single camera: {self.single_camera}')
+        # self.get_logger().info(f'⏱  Processing interval: {self.processing_interval:.3f}s  (~{1.0/self.processing_interval:.1f} Hz)')
+        # self.get_logger().info(f'⚡ Processing interval: {self.processing_interval}s ({1.0/self.processing_interval:.1f} Hz)')
         # self.get_logger().info(f'📡 Queue size: {queue_size}, Device: {self.device}')
         
         # Create a timer to check if we're receiving messages
@@ -180,13 +184,13 @@ class DeadEndDetectionNodeWithVisualization(Node):
             self.latest_messages['front_cam'] = msg
         
         # DIAGNOSTICS: Track callback rate
-        self.callback_count += 1
-        current_time = time.time()
-        if current_time - self.last_callback_time > 5.0:  # Log every 5 seconds
-            callback_rate = self.callback_count / (current_time - self.last_callback_time)
-            self.get_logger().info(f'🔄 Camera callback rate: {callback_rate:.1f} Hz')
-            self.callback_count = 0
-            self.last_callback_time = current_time
+        # self.callback_count += 1
+        # current_time = time.time()
+        # if current_time - self.last_callback_time > 5.0:  # Log every 5 seconds
+        #     callback_rate = self.callback_count / (current_time - self.last_callback_time)
+        #     # self.get_logger().info(f'🔄 Camera callback rate: {callback_rate:.1f} Hz')
+        #     self.callback_count = 0
+        #     self.last_callback_time = current_time
 
     def left_cam_callback(self, msg: Image):
         """NON-BLOCKING: Store message for later processing"""
@@ -297,8 +301,8 @@ class DeadEndDetectionNodeWithVisualization(Node):
         vec = direction_vectors[idx]
         prob = float(path_probs[idx])
         
-        # Use correct threshold (0.56) for arrow plotting
-        if prob > 0.54:  # Only plot arrows for open paths
+        # Only plot arrows for open paths.
+        if prob > 0.40:
             direction = np.array([vec[0], vec[2]])  # Use x,z components
             
             if np.linalg.norm(direction) > 0:
@@ -349,13 +353,18 @@ class DeadEndDetectionNodeWithVisualization(Node):
         
         # DEBUG: Log message status
         msg_status = {k: v is not None for k, v in messages.items()}
-        self.get_logger().info(f'📡 Messages: {msg_status}')
+        # self.get_logger().info(f'📡 Messages: {msg_status}')
         
         # Check if we have required messages
-        if not all(msg is not None for msg in [messages['front_lidar'], messages['left_lidar'], messages['right_lidar']]):
-            missing = [k for k, v in messages.items() if v is None and 'lidar' in k]
-            self.get_logger().warn(f'⚠️  Missing LiDAR data: {missing}')
-            return False
+        if self.single_camera:
+            if messages['front_lidar'] is None:
+                self.get_logger().warn('⚠️  Missing front LiDAR data')
+                return False
+        else:
+            if not all(msg is not None for msg in [messages['front_lidar'], messages['left_lidar'], messages['right_lidar']]):
+                missing = [k for k, v in messages.items() if v is None and 'lidar' in k]
+                self.get_logger().warn(f'⚠️  Missing LiDAR data: {missing}')
+                return False
         
         try:
             # Process camera images with timing
@@ -365,29 +374,31 @@ class DeadEndDetectionNodeWithVisualization(Node):
                 self.front_img_raw = np.array(img_pil)
                 self.front_img = self.transform(img_pil)
             
-            if messages['left_cam']:
-                img_pil = self.ros_image_to_pil(messages['left_cam'])
-                self.left_img_raw = np.array(img_pil)
-                self.left_img = self.transform(img_pil)
-            
-            if messages['right_cam']:
-                img_pil = self.ros_image_to_pil(messages['right_cam'])
-                self.right_img_raw = np.array(img_pil)
-                self.right_img = self.transform(img_pil)
+            if not self.single_camera:
+                if messages['left_cam']:
+                    img_pil = self.ros_image_to_pil(messages['left_cam'])
+                    self.left_img_raw = np.array(img_pil)
+                    self.left_img = self.transform(img_pil)
+                
+                if messages['right_cam']:
+                    img_pil = self.ros_image_to_pil(messages['right_cam'])
+                    self.right_img_raw = np.array(img_pil)
+                    self.right_img = self.transform(img_pil)
             
             img_conversion_time = time.time() - img_conversion_start
             self.timing_breakdown['image_conversion'].append(img_conversion_time)
             
-            # Process LiDAR data (this is the heavy part) with timing
+            # Process LiDAR data with timing
             lidar_conversion_start = time.time()
             front_points = self.ros_pointcloud_to_numpy(messages['front_lidar'])
             self.front_lidar = torch.from_numpy(front_points).float()
             
-            left_points = self.ros_pointcloud_to_numpy(messages['left_lidar'])
-            self.left_lidar = torch.from_numpy(left_points).float()
-            
-            right_points = self.ros_pointcloud_to_numpy(messages['right_lidar'])
-            self.right_lidar = torch.from_numpy(right_points).float()
+            if not self.single_camera:
+                left_points = self.ros_pointcloud_to_numpy(messages['left_lidar'])
+                self.left_lidar = torch.from_numpy(left_points).float()
+                
+                right_points = self.ros_pointcloud_to_numpy(messages['right_lidar'])
+                self.right_lidar = torch.from_numpy(right_points).float()
             
             lidar_conversion_time = time.time() - lidar_conversion_start
             self.timing_breakdown['lidar_conversion'].append(lidar_conversion_time)
@@ -409,13 +420,14 @@ class DeadEndDetectionNodeWithVisualization(Node):
         
         # DEBUG: Log that timer is being called
         if self.frame_count % 20 == 0:  # Every 20 attempts
-            self.get_logger().info(f'🕒 Timer called: frame_count={self.frame_count}')
+            # self.get_logger().info(f'🕒 Timer called: frame_count={self.frame_count}')
+            pass  # Added to fix "Expected indented block" error
         
         if current_time - self.last_processed_time < self.processing_interval:
             return
         
         # DEBUG: Log processing attempt
-        self.get_logger().info(f'🔄 Processing attempt {self.frame_count}')
+        # self.get_logger().info(f'🔄 Processing attempt {self.frame_count}')
         
         # Process latest messages (heavy computation)
         if not self.process_latest_messages():
@@ -423,10 +435,12 @@ class DeadEndDetectionNodeWithVisualization(Node):
             return
         
         # Check if we have processed LiDAR data
-        if (self.front_lidar is None or self.front_lidar.numel() == 0 or
-            self.left_lidar is None or self.left_lidar.numel() == 0 or 
-            self.right_lidar is None or self.right_lidar.numel() == 0):
+        if self.front_lidar is None or self.front_lidar.numel() == 0:
             return
+        if not self.single_camera:
+            if (self.left_lidar is None or self.left_lidar.numel() == 0 or
+                self.right_lidar is None or self.right_lidar.numel() == 0):
+                return
         
         try:
             # Tensor preparation timing
@@ -443,8 +457,12 @@ class DeadEndDetectionNodeWithVisualization(Node):
             
             # Prepare LiDAR tensors
             front_lidar = self.front_lidar.unsqueeze(0).to(self.device)
-            left_lidar = self.left_lidar.unsqueeze(0).to(self.device)
-            right_lidar = self.right_lidar.unsqueeze(0).to(self.device)
+            if self.single_camera:
+                left_lidar = None
+                right_lidar = None
+            else:
+                left_lidar = self.left_lidar.unsqueeze(0).to(self.device)
+                right_lidar = self.right_lidar.unsqueeze(0).to(self.device)            
             
             tensor_prep_time = time.time() - tensor_prep_start
             self.timing_breakdown['tensor_preparation'].append(tensor_prep_time)
@@ -454,15 +472,25 @@ class DeadEndDetectionNodeWithVisualization(Node):
             
             # Run model inference
             if self.model is None:
-                outputs = {
-                    'path_status': torch.tensor([[0.6, 0.4, 0.8]]),  # Varied dummy outputs
-                    'is_dead_end': torch.tensor([[0.2]]),
-                    'direction_vectors': torch.randn(1, 3, 3) * 0.5
-                }
+                if self.single_camera:
+                    outputs = {
+                        'path_status': torch.tensor([[0.5]]),
+                        'is_dead_end': torch.tensor([[0.2]]),
+                        'direction_vectors': torch.randn(1, 1, 3) * 0.5
+                    }
+                else:
+                    outputs = {
+                        'path_status': torch.tensor([[0.6, 0.4, 0.8]]),
+                        'is_dead_end': torch.tensor([[0.2]]),
+                        'direction_vectors': torch.randn(1, 3, 3) * 0.5
+                    }
             else:
                 with torch.no_grad():
-                    outputs = self.model(front_img, right_img, left_img,
-                                       front_lidar, right_lidar, left_lidar)
+                    if self.single_camera:
+                        outputs = self.model.forward_single_view(front_img, front_lidar)
+                    else:
+                        outputs = self.model(front_img, right_img, left_img,
+                                           front_lidar, right_lidar, left_lidar)
             
             inference_time = time.time() - inference_start
             self.timing_breakdown['model_inference'].append(inference_time)
@@ -471,9 +499,9 @@ class DeadEndDetectionNodeWithVisualization(Node):
             # Post-processing timing
             post_processing_start = time.time()
             
-            # Process results
-            path_probs = torch.sigmoid(outputs['path_status']).cpu().numpy().flatten()
-            is_dead_end = torch.sigmoid(outputs['is_dead_end']).cpu().numpy().flatten()[0]
+            # Model outputs are already sigmoid-activated
+            path_probs = outputs['path_status'].cpu().numpy().flatten()
+            is_dead_end = outputs['is_dead_end'].cpu().numpy().flatten()[0]
             direction_vectors = outputs['direction_vectors'][0]  # Remove batch dimension
             
             post_processing_time = time.time() - post_processing_start
@@ -500,43 +528,47 @@ class DeadEndDetectionNodeWithVisualization(Node):
             self.total_processed += 1
             
             # Apply correct dead-end logic for results storage
-            threshold = 0.56
-            front_open = path_probs[0] > threshold
-            left_open = path_probs[1] > threshold  
-            right_open = path_probs[2] > threshold
-            is_dead_end_correct = not (front_open or left_open or right_open)
+            threshold = 0.40
+            if self.single_camera:
+                front_open = path_probs[0] > threshold
+                is_dead_end_correct = not front_open
+            else:
+                front_open = path_probs[0] > threshold
+                left_open = path_probs[1] > threshold
+                right_open = path_probs[2] > threshold
+                is_dead_end_correct = not (front_open or left_open or right_open)
             
             # Store results for performance analysis (only if saving visualizations)
-            if self.save_visualizations:
-                self.results_history.append({
-                    'frame': self.frame_count,
-                    'front_open_prob': float(path_probs[0]),
-                    'left_open_prob': float(path_probs[1]), 
-                    'right_open_prob': float(path_probs[2]),
-                    'front_open': bool(front_open),
-                    'left_open': bool(left_open),
-                    'right_open': bool(right_open),
-                    'is_dead_end': bool(is_dead_end_correct),
-                    'open_paths_count': int(sum([front_open, left_open, right_open])),
-                    'threshold_used': threshold,
-                    'inference_time': inference_time,
-                    'total_batch_time': total_batch_time,
-                    'timing_breakdown': {
-                        'message_processing': float(self.timing_breakdown['message_processing'][-1]) if self.timing_breakdown['message_processing'] else 0.0,
-                        'image_conversion': float(self.timing_breakdown['image_conversion'][-1]) if self.timing_breakdown['image_conversion'] else 0.0,
-                        'lidar_conversion': float(self.timing_breakdown['lidar_conversion'][-1]) if self.timing_breakdown['lidar_conversion'] else 0.0,
-                        'tensor_preparation': float(self.timing_breakdown['tensor_preparation'][-1]) if self.timing_breakdown['tensor_preparation'] else 0.0,
-                        'model_inference': float(self.timing_breakdown['model_inference'][-1]) if self.timing_breakdown['model_inference'] else 0.0,
-                        'post_processing': float(self.timing_breakdown['post_processing'][-1]) if self.timing_breakdown['post_processing'] else 0.0,
-                        'total_processing': float(self.timing_breakdown['total_processing'][-1]) if self.timing_breakdown['total_processing'] else 0.0
-                    },
-                    'timestamp': current_time
-                })
+            # if self.save_visualizations:
+            #     self.results_history.append({
+            #         'frame': self.frame_count,
+            #         'front_open_prob': float(path_probs[0]),
+            #         'left_open_prob': float(path_probs[1]), 
+            #         'right_open_prob': float(path_probs[2]),
+            #         'front_open': bool(front_open),
+            #         'left_open': bool(left_open),
+            #         'right_open': bool(right_open),
+            #         'is_dead_end': bool(is_dead_end_correct),
+            #         'open_paths_count': int(sum([front_open, left_open, right_open])),
+            #         'threshold_used': threshold,
+            #         'inference_time': inference_time,
+            #         'total_batch_time': total_batch_time,
+            #         'timing_breakdown': {
+            #             'message_processing': float(self.timing_breakdown['message_processing'][-1]) if self.timing_breakdown['message_processing'] else 0.0,
+            #             'image_conversion': float(self.timing_breakdown['image_conversion'][-1]) if self.timing_breakdown['image_conversion'] else 0.0,
+            #             'lidar_conversion': float(self.timing_breakdown['lidar_conversion'][-1]) if self.timing_breakdown['lidar_conversion'] else 0.0,
+            #             'tensor_preparation': float(self.timing_breakdown['tensor_preparation'][-1]) if self.timing_breakdown['tensor_preparation'] else 0.0,
+            #             'model_inference': float(self.timing_breakdown['model_inference'][-1]) if self.timing_breakdown['model_inference'] else 0.0,
+            #             'post_processing': float(self.timing_breakdown['post_processing'][-1]) if self.timing_breakdown['post_processing'] else 0.0,
+            #             'total_processing': float(self.timing_breakdown['total_processing'][-1]) if self.timing_breakdown['total_processing'] else 0.0
+            #         },
+            #         'timestamp': current_time
+            #     })
             
             # Simple logging for robot mode with detailed timing
-            elif self.robot_mode and self.frame_count % 10 == 0:  # Log every 10th frame
-                self.print_timing_summary()
-                self.get_logger().info(f'🤖 Frame {self.frame_count}: Paths F={path_probs[0]:.3f} L={path_probs[1]:.3f} R={path_probs[2]:.3f} | Total: {total_batch_time*1000:.1f}ms | Inference: {inference_time*1000:.1f}ms')
+            # elif self.robot_mode and self.frame_count % 10 == 0:  # Log every 10th frame
+            #     self.print_timing_summary()
+            #     self.get_logger().info(f'🤖 Frame {self.frame_count}: Paths F={path_probs[0]:.3f} L={path_probs[1]:.3f} R={path_probs[2]:.3f} | Total: {total_batch_time*1000:.1f}ms | Inference: {inference_time*1000:.1f}ms')
             
             # Clear processed data
             self.clear_data()
@@ -547,8 +579,8 @@ class DeadEndDetectionNodeWithVisualization(Node):
 
     def print_frame_status(self, path_probs, is_dead_end, inference_time, total_batch_time):
         """Print comprehensive status for each processed frame"""
-        # Correct dead-end logic: if NO path has >0.56 probability, it's a dead end
-        threshold = 0.56
+        # Correct dead-end logic: if NO path has > threshold probability, it's a dead end.
+        threshold = 0.40
         front_open = path_probs[0] > threshold
         left_open = path_probs[1] > threshold  
         right_open = path_probs[2] > threshold
@@ -587,7 +619,7 @@ class DeadEndDetectionNodeWithVisualization(Node):
             
         try:
             # Apply correct dead-end logic (same as print_frame_status)
-            threshold = 0.56
+            threshold = 0.4
             front_open = path_probs[0] > threshold
             left_open = path_probs[1] > threshold  
             right_open = path_probs[2] > threshold
@@ -648,7 +680,7 @@ class DeadEndDetectionNodeWithVisualization(Node):
                 'total_frames': self.total_processed,
                 'avg_inference_time': float(np.mean(self.processing_times)) if self.processing_times else 0,
                 'avg_fps': float(1.0 / np.mean(self.processing_times)) if self.processing_times else 0,
-                'threshold_used': 0.56,
+                'threshold_used': 0.40,
                 'dead_end_rate': float(np.mean([r['is_dead_end'] for r in self.results_history])) if self.results_history else 0,
                 'avg_open_paths_per_frame': float(np.mean([r['open_paths_count'] for r in self.results_history])) if self.results_history else 0,
                 'open_path_rates': {
@@ -694,19 +726,18 @@ class DeadEndDetectionNodeWithVisualization(Node):
 
     def publish_results(self, outputs: Dict[str, torch.Tensor]):
         """Publish model outputs: path_status and is_dead_end"""
-        # Compute path probabilities
-        path_probs = torch.sigmoid(outputs['path_status']).cpu().numpy().flatten()
+        path_probs = outputs['path_status'].cpu().numpy().flatten()
 
-        # Compute is_dead_end: all 3 directions blocked below threshold
-        threshold = 0.56
-        is_dead_end = not any(p > threshold for p in path_probs[:3])
+        threshold = 0.40
+        if self.single_camera:
+            is_dead_end = path_probs[0] <= threshold
+        else:
+            is_dead_end = not any(p > threshold for p in path_probs[:3])
 
-        # Publish dead end status
         dead_end_msg = Bool()
         dead_end_msg.data = bool(is_dead_end)
         self.dead_end_pub.publish(dead_end_msg)
 
-        # Publish path status [front, left, right]
         path_msg = Float32MultiArray()
         path_msg.data = path_probs.tolist()
         self.path_status_pub.publish(path_msg)
@@ -719,7 +750,7 @@ class DeadEndDetectionNodeWithVisualization(Node):
         lidar_msgs = sum(1 for k, v in msg_status.items() if 'lidar' in k and v)
         camera_msgs = sum(1 for k, v in msg_status.items() if 'cam' in k and v)
         
-        self.get_logger().info(f'📊 Diagnostic: LiDAR={lidar_msgs}/3, Camera={camera_msgs}/3, Processed={self.total_processed}')
+        # self.get_logger().info(f'📊 Diagnostic: LiDAR={lidar_msgs}/3, Camera={camera_msgs}/3, Processed={self.total_processed}')
         
         if lidar_msgs == 0:
             self.get_logger().warn('🚨 NO LIDAR MESSAGES RECEIVED! Check pointcloud_segmenter or robot connection')
@@ -761,14 +792,14 @@ def main(args=None):
         # Save final results (only if saving visualizations)
         if node.save_visualizations:
             node.save_results_json()
-        node.get_logger().info(f'📊 Final stats: {node.total_processed} frames processed')
+        # node.get_logger().info(f'📊 Final stats: {node.total_processed} frames processed')
         if node.processing_times:
             avg_time = np.mean(node.processing_times)
             node.get_logger().info(f'⚡ Average inference: {avg_time*1000:.1f}ms ({1.0/avg_time:.1f} FPS)')
         
         # Print final timing summary
         if node.timing_breakdown:
-            node.get_logger().info('📊 FINAL TIMING SUMMARY:')
+            # node.get_logger().info('📊 FINAL TIMING SUMMARY:')
             node.print_timing_summary()
     finally:
         executor.shutdown()

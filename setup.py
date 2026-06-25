@@ -23,6 +23,9 @@ setup(
     license='Apache License 2.0',
     entry_points={
         'console_scripts': [
+            # Shared global planner
+            'global_planner = map_contruct.scripts.planning.global_planner:main',
+
             # Baselines
             'dwa_planner = map_contruct.baselines.dwa.dwa_planner:main',
             'mppi_planner = map_contruct.baselines.mppi.mppi_planner:main',
@@ -31,6 +34,9 @@ setup(
             # Goal Generator
             'goal_generator = map_contruct.goal_generator.goal_generator:main',
             
+            # Scripts - Control
+            'direct_vel_controller = map_contruct.scripts.control.direct_vel_controller:main',
+
             # Scripts - Inference
             'infer_vis = map_contruct.scripts.inference.infer_vis:main',
             

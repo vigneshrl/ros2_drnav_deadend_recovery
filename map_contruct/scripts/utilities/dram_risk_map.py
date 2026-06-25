@@ -30,6 +30,7 @@ from tf2_ros import TransformListener, Buffer
 import math
 import time
 import numpy as np
+from scipy.ndimage import binary_dilation
 
 from map_contruct.scripts.utilities.recovery_points import RecoveryPointManager
 
@@ -37,6 +38,13 @@ from map_contruct.scripts.utilities.recovery_points import RecoveryPointManager
 class DRaMRiskMap(Node):
     def __init__(self):
         super().__init__('dram_risk_map')
+
+        # TF frame parameters (allow namespaced robots like 93/base_link)
+        self.map_frame = str(self.declare_parameter('map_frame', 'map').value)
+        self.robot_base_frame = str(
+            self.declare_parameter('robot_base_frame', '93/base_link').value
+        )
+        self._last_tf_warn_time = 0.0
 
         # ── Subscribers ──────────────────────────────────────────────────
         self.path_sub = self.create_subscription(
@@ -65,6 +73,10 @@ class DRaMRiskMap(Node):
         self.cost_layer_pub = self.create_publisher(
             MarkerArray, '/cost_layer', 10
         )
+        # Local costmap as OccupancyGrid — for RViz2 comparison with baselines
+        self.local_costmap_pub = self.create_publisher(
+            OccupancyGrid, '/local_costmap', 10
+        )
 
         # ── TF ───────────────────────────────────────────────────────────
         self.tf_buffer = Buffer()
@@ -72,7 +84,7 @@ class DRaMRiskMap(Node):
 
         # ── Recovery point tracking ───────────────────────────────────────
         self.recovery_manager = RecoveryPointManager(
-            confidence_threshold=0.56,
+            confidence_threshold=0.40,
             max_stored_points=50,
             min_distance_m=1.0,
             max_age_s=60.0
@@ -92,9 +104,35 @@ class DRaMRiskMap(Node):
 
         # ── Map ───────────────────────────────────────────────────────────
         self.current_map = None
-        self.threshold = 0.56             # single threshold used everywhere
+        self.threshold = 0.40            # fallback fixed open/closed threshold
 
-        self.get_logger().info('DRaM Risk Map initialized')
+        # ── Single-camera calibrated drop threshold ───────────────────────
+        # During startup, assume the robot begins in open space and estimate
+        # the model's normal "open" confidence. After calibration, classify
+        # the path as blocked if confidence drops more than this amount.
+        self.use_calibrated_threshold = bool(
+            self.declare_parameter('use_calibrated_threshold', True).value
+        )
+        self.calibration_sample_count = int(
+            self.declare_parameter('calibration_sample_count', 30).value
+        )
+        self.calibration_drop_threshold = float(
+            self.declare_parameter('calibration_drop_threshold', 0.05).value
+        )
+        self.calibration_samples = []
+        self.baseline_prob = None
+        self._last_threshold_log_time = 0.0
+
+        # OccupancyGrid semantics: -1 unknown, 0 free, 100 occupied.
+        # Block only occupied cells so unknown space can still be explored.
+        self.occupied_cell_threshold = int(
+            self.declare_parameter('occupied_cell_threshold', 50).value
+        )
+
+        self.get_logger().info(
+            f'DRaM Risk Map initialized (map_frame={self.map_frame}, '
+            f'robot_base_frame={self.robot_base_frame})'
+        )
 
     # ─────────────────────────────────────────────────────────────────────
     # Callbacks
@@ -103,15 +141,61 @@ class DRaMRiskMap(Node):
     def map_callback(self, msg: OccupancyGrid):
         self.current_map = msg
 
+    def _single_camera_is_open(self, p: float) -> bool:
+        """Calibrate in open space, then detect drops from that baseline."""
+        if not self.use_calibrated_threshold:
+            return p > self.threshold
+
+        # Calibration phase: assume the robot starts in open space.
+        if self.baseline_prob is None:
+            self.calibration_samples.append(p)
+
+            if len(self.calibration_samples) >= self.calibration_sample_count:
+                self.baseline_prob = float(np.median(self.calibration_samples))
+                self.get_logger().info(
+                    f'Calibrated path_status baseline: {self.baseline_prob:.3f}; '
+                    f'drop threshold: {self.calibration_drop_threshold:.3f}'
+                )
+
+            # During calibration, treat the path as open so startup samples do not
+            # immediately mark the local area as blocked.
+            return True
+
+        drop = self.baseline_prob - p
+        is_open = drop <= self.calibration_drop_threshold
+
+        # Rate-limit logs so this does not spam every callback.
+        now = time.time()
+        if now - self._last_threshold_log_time > 1.0:
+            self.get_logger().info(
+                f'path_status={p:.3f}, baseline={self.baseline_prob:.3f}, '
+                f'drop={drop:.3f}, open={is_open}'
+            )
+            self._last_threshold_log_time = now
+
+        return is_open
+
     def path_status_callback(self, msg: Float32MultiArray):
-        if len(msg.data) < 3:
+        if len(msg.data) < 1:
             return
 
         robot_x, robot_y, robot_yaw, frame_id = self._get_robot_position()
         current_time = time.time()
 
-        probs = list(msg.data[:3])   # [front, left, right]
-        path_binary = [1 if p > self.threshold else 0 for p in probs]
+        # Support both single-camera (1 value) and multi-camera (3 values).
+        # Multi-camera keeps the original fixed-threshold behavior.
+        # Single-camera uses startup calibration + drop detection.
+        if len(msg.data) >= 3:
+            probs = list(msg.data[:3])
+            path_binary = [1 if p > self.threshold else 0 for p in probs]
+        else:
+            p = float(msg.data[0])
+            is_open = self._single_camera_is_open(p)
+
+            # Keep old shape so downstream visualization/recovery logic still works.
+            probs = [p] * 3
+            path_binary = [1 if is_open else 0] * 3
+
         front_open, left_open, right_open = path_binary
         open_count = sum(path_binary)
         is_dead_end = (open_count == 0)
@@ -147,6 +231,9 @@ class DRaMRiskMap(Node):
         # 5. Publish dram_exploration_map ─────────────────────────────────
         self._publish_exploration_map(frame_id)
 
+        # 6. Publish local costmap (OccupancyGrid for RViz comparison) ────
+        self._publish_local_costmap(robot_x, robot_y, frame_id)
+
         # Clean old cost history
         cutoff = current_time - self.max_history_age
         self.cost_history = {k: v for k, v in self.cost_history.items()
@@ -175,14 +262,17 @@ class DRaMRiskMap(Node):
                 grid_pos = (int(math.floor(wx / self.grid_resolution)),
                             int(math.floor(wy / self.grid_resolution)))
 
-                distance_weight = max(0.1, 1.0 - dist / self.exploration_radius)
-                weighted_safety = safety_level * distance_weight
+                # Use binary evidence from current model output:
+                # 1.0 if any direction is open, 0.0 for dead-end.
+                # This keeps local costmap semantics clear (free vs blocked).
+                weighted_safety = safety_level
 
                 if grid_pos in self.explored_grid:
                     old_safety = self.explored_grid[grid_pos]['safety']
-                    # Only update the cell the robot is directly at;
-                    # leave surrounding cells with their existing value
-                    new_safety = weighted_safety if dist <= self.grid_resolution else old_safety
+                    # Smooth updates so previously blocked cells can recover
+                    # once open-path evidence is observed.
+                    alpha = 0.4
+                    new_safety = (1.0 - alpha) * old_safety + alpha * weighted_safety
                 else:
                     new_safety = weighted_safety
 
@@ -206,8 +296,11 @@ class DRaMRiskMap(Node):
                 if cx < 0 or cx >= info.width or cy < 0 or cy >= info.height:
                     continue
                 idx = cy * info.width + cx
-                if idx < len(self.current_map.data) and self.current_map.data[idx] != 0:
-                    return False
+                if idx < len(self.current_map.data):
+                    occ = self.current_map.data[idx]
+                    # Only treat high occupancy as blocked; allow unknown (-1).
+                    if occ > self.occupied_cell_threshold:
+                        return False
         return True
 
     # ─────────────────────────────────────────────────────────────────────
@@ -417,7 +510,6 @@ class DRaMRiskMap(Node):
             txt.action = Marker.ADD
             txt.pose.position.x = rp.x
             txt.pose.position.y = rp.y
-            txt.pose.position.z = 0.35
             txt.pose.orientation.w = 1.0
             txt.scale.z = 0.15
             txt.text = f'{rp.rank} open'
@@ -429,23 +521,67 @@ class DRaMRiskMap(Node):
         self.risk_map_pub.publish(marker_array)
 
     # ─────────────────────────────────────────────────────────────────────
+    # Local costmap publishing (/local_costmap)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _publish_local_costmap(self, rx, ry, frame_id):
+        """Convert explored_grid Bayesian safety scores → OccupancyGrid."""
+        res = self.grid_resolution          # 0.3 m/cell
+        half = 5.0                          # 10 m × 10 m window
+        n = int(math.ceil(2 * half / res))  # cells per side (~34)
+
+        grid = np.full((n, n), -1, dtype=np.int8)  # -1 = unknown
+
+        origin_x = rx - half
+        origin_y = ry - half
+
+        for row in range(n):
+            for col in range(n):
+                wx = origin_x + (col + 0.5) * res
+                wy = origin_y + (row + 0.5) * res
+                key = (int(math.floor(wx / res)), int(math.floor(wy / res)))
+                if key in self.explored_grid:
+                    safety = self.explored_grid[key]['safety']
+                    # safety 0.0 → cost 100 (dead end), 1.0 → cost 0 (free)
+                    grid[row, col] = int(round((1.0 - safety) * 100))
+
+        msg = OccupancyGrid()
+        msg.header.frame_id = frame_id
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.info.resolution = res
+        msg.info.width = n
+        msg.info.height = n
+        msg.info.origin.position.x = origin_x
+        msg.info.origin.position.y = origin_y
+        msg.info.origin.orientation.w = 1.0
+        msg.data = grid.flatten().tolist()
+        self.local_costmap_pub.publish(msg)
+
+    # ─────────────────────────────────────────────────────────────────────
     # TF helper
     # ─────────────────────────────────────────────────────────────────────
 
     def _get_robot_position(self):
         try:
             t = self.tf_buffer.lookup_transform(
-                'map', 'base_link', rclpy.time.Time(),
+                self.map_frame, self.robot_base_frame, rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.1)
             )
             return (
                 t.transform.translation.x,
                 t.transform.translation.y,
                 t.transform.rotation.z,
-                'map'
+                self.map_frame
             )
-        except Exception:
-            return (0.0, 0.0, 0.0, 'map')
+        except Exception as exc:
+            now = time.time()
+            if now - self._last_tf_warn_time > 2.0:
+                self.get_logger().warn(
+                    f'Failed TF lookup {self.map_frame} -> '
+                    f'{self.robot_base_frame}: {exc}'
+                )
+                self._last_tf_warn_time = now
+            return (0.0, 0.0, 0.0, self.map_frame)
 
 
 def main(args=None):
