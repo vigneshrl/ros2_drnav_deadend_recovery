@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Isaac Sim 6.0 — DR.Nav Jackal Sensor + WebRTC Keyboard Teleop (v3)
+Isaac Sim 6.0 — DR.Nav Jackal + WebRTC Keyboard + Official RTX LiDAR Graph (v5)
 ===================================================
 
 Run from:
@@ -10,8 +10,9 @@ What this version does:
     - Reuses the existing Jackal Bumblebee stereo camera prims.
     - Publishes the left camera as the primary DR.Nav RGB stream.
     - Optionally publishes the right stereo camera.
-    - Creates one RTX rotary LiDAR under the existing SICK LiDAR frame.
-    - Publishes PointCloud2 and LaserScan through ROS 2.
+    - Creates one RTX rotary 3D LiDAR under the existing SICK LiDAR frame.
+    - Publishes PointCloud2 through the official Isaac Create Render Product
+      + ROS2 RTX Lidar Helper OmniGraph pipeline.
     - Publishes /odom_lidar and /clock through an Action Graph.
     - Supports direct W/A/S/D keyboard teleop inside the WebRTC viewport.
     - Still subscribes to /cmd_vel for later ROS-based control.
@@ -94,6 +95,7 @@ SHOW_LIDAR_DEBUG_VIEW = False
 TOPIC_FRONT_RGB = "/argus/ar0234_front_left/image_raw"
 TOPIC_RIGHT_RGB = "/argus/ar0234_front_right/image_raw"
 TOPIC_POINT_CLOUD = "/os_cloud_node/points"
+# A separate Example_Rotary_2D sensor will be added later for /scan.
 TOPIC_SCAN = "/scan"
 TOPIC_ODOM = "/odom_lidar"
 TOPIC_CMD_VEL = "/cmd_vel"
@@ -313,6 +315,7 @@ class DRNavIsaacSim6Bridge:
             "isaacsim.ros2.bridge",
             "isaacsim.ros2.nodes",
             "isaacsim.sensors.experimental.rtx",
+            "isaacsim.sensors.rtx.nodes",
         ]
 
         for extension_id in extension_ids:
@@ -383,9 +386,8 @@ class DRNavIsaacSim6Bridge:
 
     def _setup_lidar_publishers(self) -> None:
         # The uploaded Jackal scene authors sick_lms1xx_lidar_frame as
-        # active=false. USD does not allow a child prim to be defined beneath
-        # an inactive parent, so reactivate the mount before creating the RTX
-        # LiDAR beneath it.
+        # active=false. USD does not allow a child prim beneath an inactive
+        # parent, so reactivate the mount before creating the RTX LiDAR.
         lidar_mount_prim = self.stage.GetPrimAtPath(LIDAR_FRAME_PATH)
 
         if not lidar_mount_prim.IsValid():
@@ -400,7 +402,6 @@ class DRNavIsaacSim6Bridge:
                 f"{LIDAR_FRAME_PATH}"
             )
 
-        # Create a 6.0 RTX LiDAR exactly at the existing SICK mount frame.
         self._lidar_sensor = Lidar.create(
             path=LIDAR_SENSOR_PATH,
             config=LIDAR_CONFIG,
@@ -409,31 +410,12 @@ class DRNavIsaacSim6Bridge:
             orientations=[[1.0, 0.0, 0.0, 0.0]],
         )
 
-        self._lidar_render_product = rep.create.render_product(
-            self._lidar_sensor.paths[0],
-            [1, 1],
-            name="DRNavLidar",
-        )
-
-        self._lidar_pc_writer = rep.writers.get(
-            "RtxLidarROS2PublishPointCloud"
-        )
-        self._lidar_pc_writer.initialize(
-            topicName=TOPIC_POINT_CLOUD,
-            frameId=FRAME_LIDAR,
-        )
-        self._lidar_pc_writer.attach([self._lidar_render_product])
-
-        # Isaac Sim 6.0's official example uses a separate 2D sensor for
-        # RtxLidarROS2PublishLaserScan. Here we publish a LaserScan from the same
-        # rotary sensor through the ROS2RtxLidarHelper Action Graph below only if
-        # your build supports it. To keep this first migration robust, the
-        # PointCloud2 publisher is always enabled; /scan is added in the graph.
-        if SHOW_LIDAR_DEBUG_VIEW:
-            self._lidar_debug_writer = rep.writers.get(
-                "RtxLidarDebugDrawPointCloudBuffer"
-            )
-            self._lidar_debug_writer.attach(self._lidar_render_product)
+        # Do not create or attach the LiDAR render product here. In Script
+        # Editor, direct Replicator attachment can race the RTX sensor pipeline
+        # and leave stale annotator state after reruns. The Action Graph below
+        # creates the render product exactly once, following NVIDIA's 6.0
+        # reference graph.
+        self._lidar_render_product = None
 
         print(
             f"[DR.Nav] RTX LiDAR created: {LIDAR_SENSOR_PATH} "
@@ -447,15 +429,38 @@ class DRNavIsaacSim6Bridge:
     def _setup_odom_and_clock_graph(self) -> None:
         create_nodes = [
             ("tick", "omni.graph.action.OnPlaybackTick"),
+            (
+                "lidar_once",
+                "isaacsim.core.nodes.OgnIsaacRunOneSimulationFrame",
+            ),
+            (
+                "lidar_render_product",
+                "isaacsim.core.nodes.IsaacCreateRenderProduct",
+            ),
+            (
+                "lidar_pointcloud",
+                "isaacsim.ros2.bridge.ROS2RtxLidarHelper",
+            ),
             ("simtime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
-            ("lidar_scan", "isaacsim.ros2.bridge.ROS2RtxLidarHelper"),
             ("odomcompute", "isaacsim.core.nodes.IsaacComputeOdometry"),
             ("odompub", "isaacsim.ros2.bridge.ROS2PublishOdometry"),
             ("clock", "isaacsim.ros2.bridge.ROS2PublishClock"),
         ]
 
         connections = [
-            ("tick.outputs:tick", "lidar_scan.inputs:execIn"),
+            ("tick.outputs:tick", "lidar_once.inputs:execIn"),
+            (
+                "lidar_once.outputs:step",
+                "lidar_render_product.inputs:execIn",
+            ),
+            (
+                "lidar_render_product.outputs:execOut",
+                "lidar_pointcloud.inputs:execIn",
+            ),
+            (
+                "lidar_render_product.outputs:renderProductPath",
+                "lidar_pointcloud.inputs:renderProductPath",
+            ),
             ("tick.outputs:tick", "odomcompute.inputs:execIn"),
             ("tick.outputs:tick", "odompub.inputs:execIn"),
             ("tick.outputs:tick", "clock.inputs:execIn"),
@@ -477,14 +482,15 @@ class DRNavIsaacSim6Bridge:
         ]
 
         set_values = [
+            ("lidar_render_product.inputs:width", 1),
+            ("lidar_render_product.inputs:height", 1),
             (
-                "lidar_scan.inputs:renderProductPath",
-                self._lidar_render_product.path,
+                "lidar_pointcloud.inputs:topicName",
+                TOPIC_POINT_CLOUD,
             ),
-            ("lidar_scan.inputs:topicName", TOPIC_SCAN),
-            ("lidar_scan.inputs:frameId", FRAME_LIDAR),
-            ("lidar_scan.inputs:type", "laser_scan"),
-            ("lidar_scan.inputs:showDebugView", False),
+            ("lidar_pointcloud.inputs:frameId", FRAME_LIDAR),
+            ("lidar_pointcloud.inputs:type", "point_cloud"),
+            ("lidar_pointcloud.inputs:showDebugView", False),
             ("odompub.inputs:topicName", TOPIC_ODOM),
             ("odompub.inputs:chassisFrameId", FRAME_BASE),
             ("odompub.inputs:odomFrameId", FRAME_ODOM),
@@ -523,12 +529,21 @@ class DRNavIsaacSim6Bridge:
         )
 
         set_target_prims(
+            primPath=f"{GRAPH_PATH}/lidar_render_product",
+            inputName="inputs:cameraPrim",
+            targetPrimPaths=[LIDAR_SENSOR_PATH],
+        )
+
+        set_target_prims(
             primPath=f"{GRAPH_PATH}/odomcompute",
             inputName="inputs:chassisPrim",
             targetPrimPaths=[BASE_LINK_PATH],
         )
 
-        print(f"[DR.Nav] ROS 2 Action Graph created: {GRAPH_PATH}")
+        print(
+            "[DR.Nav] ROS 2 Action Graph created with official one-frame "
+            "RTX LiDAR render-product bootstrap."
+        )
 
     # -------------------------------------------------------------------------
     # ROS node and TF
@@ -847,8 +862,11 @@ Verify ROS topics from a ROS 2 terminal:
   ros2 topic list
   ros2 topic hz {TOPIC_FRONT_RGB}
   ros2 topic hz {TOPIC_POINT_CLOUD}
-  ros2 topic hz {TOPIC_SCAN}
   ros2 topic hz {TOPIC_ODOM}
+
+Note: /scan is intentionally not created in v5. NVIDIA's 6.0 reference
+uses a separate Example_Rotary_2D sensor for LaserScan. The 3D point
+cloud remains available on /os_cloud_node/points.
 
 Verify transforms:
 
@@ -891,7 +909,7 @@ async def _main() -> None:
     except NameError:
         previous = None
 
-    if previous is not None:
+
         try:
             previous.shutdown()
         except Exception as exc:
