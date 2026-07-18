@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Isaac Sim 6.0 — DR.Nav Jackal Setup (v6, reuse existing sensors)
+Isaac Sim 6.0 — DR.Nav Jackal Setup (v6b, reuse existing sensors)
 ================================================================
 
 Run from:
@@ -67,7 +67,7 @@ RIGHT_CAMERA_PATH = (
 )
 
 LIDAR_FRAME_PATH = f"{BASE_LINK_PATH}/sick_lms1xx_lidar_frame"
-LIDAR_SENSOR_PATH = f"{LIDAR_FRAME_PATH}/lidar"
+LIDAR_SENSOR_PATH = f"{LIDAR_FRAME_PATH}/Lidar"
 
 # This graph is authored only into the anonymous USD session layer.
 GRAPH_PATH = "/World/DRNav_RuntimeGraph"
