@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Isaac Sim 6.0 — DR.Nav Jackal Setup (v6b, reuse existing sensors)
+Isaac Sim 6.0 — DR.Nav Jackal Setup (v6c, WebRTC hold-key fix)
 ================================================================
 
 Run from:
@@ -108,7 +108,13 @@ ENABLE_WEBRTC_KEYBOARD_TELEOP = True
 
 KEYBOARD_LINEAR_SPEED_M_S = 0.15
 KEYBOARD_ANGULAR_SPEED_RAD_S = 0.40
-KEYBOARD_EVENT_TIMEOUT_S = 1.25
+
+# WebRTC clients do not always emit repeated keyboard events while a key is
+# held. The old 1.25-second watchdog therefore cleared W/A/S/D even though the
+# user was still holding the key, producing a fixed travel distance and only a
+# few degrees of turning.
+ENABLE_KEYBOARD_WATCHDOG = False
+KEYBOARD_EVENT_TIMEOUT_S = 10.0
 
 # Smooth acceleration reduces wheelspin/slipping from instantaneous commands.
 MAX_LINEAR_ACCEL_M_S2 = 0.35
@@ -1204,6 +1210,10 @@ class DRNavIsaacSim6Bridge:
         print("         W = forward, S = reverse")
         print("         A = turn left, D = turn right")
         print("         SPACE = immediate stop")
+        print(
+            "[DR.Nav] WebRTC key watchdog disabled: held keys remain active "
+            "until KEY_RELEASE."
+        )
 
     def _on_keyboard_event(self, event) -> bool:
         handled_keys = {
@@ -1242,7 +1252,8 @@ class DRNavIsaacSim6Bridge:
 
     def _get_keyboard_command(self) -> Tuple[float, float]:
         if (
-            self._pressed_keys
+            ENABLE_KEYBOARD_WATCHDOG
+            and self._pressed_keys
             and time.monotonic() - self._last_keyboard_event_time
             > KEYBOARD_EVENT_TIMEOUT_S
         ):
