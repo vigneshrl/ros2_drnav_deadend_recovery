@@ -1,686 +1,520 @@
 #!/usr/bin/env python3
 """
-Isaac Sim 6.0 — DR.Nav Jackal + WebRTC Keyboard + Official RTX LiDAR Graph (v5)
-===================================================
+Isaac Sim 6.0 — DR.Nav Jackal runtime setup (compact)
+=====================================================
 
-Run from:
-    Isaac Sim -> Window -> Script Editor
+Scene-specific version for the current project:
 
-What this version does:
-    - Reuses the existing Jackal Bumblebee stereo camera prims.
-    - Publishes the left camera as the primary DR.Nav RGB stream.
-    - Optionally publishes the right stereo camera.
-    - Creates one RTX rotary 3D LiDAR under the existing SICK LiDAR frame.
-    - Publishes PointCloud2 through the official Isaac Create Render Product
-      + ROS2 RTX Lidar Helper OmniGraph pipeline.
-    - Publishes /odom_lidar and /clock through an Action Graph.
-    - Supports direct W/A/S/D keyboard teleop inside the WebRTC viewport.
-    - Still subscribes to /cmd_vel for later ROS-based control.
-    - Publishes odom -> base_link TF and static sensor transforms.
+- Existing Jackal:
+    /World/ground/flat_plane/jackal
+- Existing Bumblebee left camera
+- Existing PhysX LiDAR:
+    .../sick_lms1xx_lidar_frame/Lidar
+- W/A/S/D WebRTC teleoperation
+- ROS 2 camera, LaserScan, PointCloud2, odometry, clock and TF
+- ROS 2 /cmd_vel support when keyboard control is disabled
+- Runtime camera graph authored only in the USD session layer
 
-Important:
-    - This is written for Isaac Sim 6.0 APIs.
-    - It intentionally does not create the three legacy front/side cameras from
-      the repository's Isaac Sim 4.5 script.
-    - The stock DR.Nav inference node expects three camera topics. Our current
-      project uses the existing forward Bumblebee camera, so the downstream
-      model/input code must later be aligned with that sensor choice.
-    - The manual navigation-zone annotator is a separate next step.
-
-Before running:
-    1. Open the maze USD.
-    2. Enable/playable physics must be present on the Jackal.
-    3. Launch Isaac Sim from a terminal with ROS 2 sourced, or configure its
-       internal ROS libraries.
+Run from Isaac Sim's Script Editor with the maze open.
 """
 
 from __future__ import annotations
 
 import asyncio
+import builtins
 import math
 import time
-from typing import Optional
+from typing import Tuple
 
-import numpy as np
 import carb.input
+import numpy as np
 import omni.appwindow
 import omni.graph.core as og
 import omni.kit.app
-import omni.replicator.core as rep
 import omni.timeline
 import omni.usd
 from pxr import Usd, UsdGeom
 
 
-# =============================================================================
-# USER CONFIGURATION
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Scene paths
+# -----------------------------------------------------------------------------
 
-ROBOT_PRIM = "/World/ground/flat_plane/jackal"
-BASE_LINK_PATH = f"{ROBOT_PRIM}/base_link"
+ROBOT = "/World/ground/flat_plane/jackal"
+BASE_LINK = f"{ROBOT}/base_link"
 
-BUMBLEBEE_ROOT = f"{BASE_LINK_PATH}/bumblebee_stereo_camera_frame"
-
-LEFT_CAMERA_FRAME_PATH = (
-    f"{BUMBLEBEE_ROOT}/bumblebee_stereo_left_frame"
+CAMERA_FRAME = (
+    f"{BASE_LINK}/bumblebee_stereo_camera_frame/"
+    "bumblebee_stereo_left_frame"
 )
-LEFT_CAMERA_PATH = (
-    f"{LEFT_CAMERA_FRAME_PATH}/bumblebee_stereo_left_camera"
-)
+CAMERA = f"{CAMERA_FRAME}/bumblebee_stereo_left_camera"
 
-RIGHT_CAMERA_FRAME_PATH = (
-    f"{BUMBLEBEE_ROOT}/bumblebee_stereo_right_frame"
-)
-RIGHT_CAMERA_PATH = (
-    f"{RIGHT_CAMERA_FRAME_PATH}/bumblebee_stereo_right_camera"
-)
+LIDAR_FRAME = f"{BASE_LINK}/sick_lms1xx_lidar_frame"
+LIDAR = f"{LIDAR_FRAME}/Lidar"
 
-# Existing mount frame in the Jackal asset.
-LIDAR_FRAME_PATH = f"{BASE_LINK_PATH}/sick_lms1xx_lidar_frame"
+RUNTIME_GRAPH = "/World/DRNav_RuntimeGraph"
 
-# A new Isaac Sim 6.0 RTX LiDAR sensor is created beneath that mount.
-LIDAR_SENSOR_PATH = f"{LIDAR_FRAME_PATH}/drnav_rtx_lidar"
 
-# Official Isaac Sim 6.0 example configuration.
-# It is a 360-degree rotary 3D LiDAR running at 10 Hz.
-LIDAR_CONFIG = "Example_Rotary"
-LIDAR_TICK_RATE_HZ = 10.0
+# -----------------------------------------------------------------------------
+# ROS names
+# -----------------------------------------------------------------------------
 
-GRAPH_PATH = "/World/DRNav_Graph"
-
-CAMERA_RESOLUTION = (640, 480)
-PUBLISH_RIGHT_STEREO_CAMERA = False
-SHOW_LIDAR_DEBUG_VIEW = False
-
-TOPIC_FRONT_RGB = "/argus/ar0234_front_left/image_raw"
-TOPIC_RIGHT_RGB = "/argus/ar0234_front_right/image_raw"
-TOPIC_POINT_CLOUD = "/os_cloud_node/points"
-# A separate Example_Rotary_2D sensor will be added later for /scan.
+TOPIC_IMAGE = "/argus/ar0234_front_left/image_raw"
 TOPIC_SCAN = "/scan"
+TOPIC_POINTS = "/os_cloud_node/points"
 TOPIC_ODOM = "/odom_lidar"
+TOPIC_CLOCK = "/clock"
 TOPIC_CMD_VEL = "/cmd_vel"
 
-FRAME_BASE = "base_link"
-FRAME_LEFT_CAMERA = "bumblebee_stereo_left_frame"
-FRAME_RIGHT_CAMERA = "bumblebee_stereo_right_frame"
-FRAME_LIDAR = "sim_lidar"
 FRAME_ODOM = "odom"
+FRAME_BASE = "base_link"
+FRAME_CAMERA = "bumblebee_stereo_left_frame"
+FRAME_LIDAR = "sim_lidar"
 
-# Jackal dimensions used by the original repository controller.
-WHEEL_RADIUS_M = 0.098
-TRACK_WIDTH_M = 0.37559
 
-WHEEL_JOINT_NAMES = [
+# -----------------------------------------------------------------------------
+# Robot and input settings
+# -----------------------------------------------------------------------------
+
+CAMERA_RESOLUTION = (640, 480)
+
+USE_WEBRTC_KEYBOARD = True
+LINEAR_SPEED = 0.15
+ANGULAR_SPEED = 0.40
+
+MAX_LINEAR_ACCEL = 0.35
+MAX_ANGULAR_ACCEL = 0.90
+
+WHEEL_RADIUS = 0.098
+TRACK_WIDTH = 0.37559
+MAX_WHEEL_SPEED = 25.0
+
+LEFT_WHEEL_SIGN = 1.0
+RIGHT_WHEEL_SIGN = 1.0
+
+CMD_TIMEOUT = 0.5
+ODOM_RATE = 30.0
+LIDAR_RATE = 10.0
+
+WHEEL_JOINTS = [
     "front_left_wheel_joint",
     "front_right_wheel_joint",
     "rear_left_wheel_joint",
     "rear_right_wheel_joint",
 ]
 
-# Change these only if a movement test shows reversed wheel directions.
-LEFT_WHEEL_SIGN = 1.0
-RIGHT_WHEEL_SIGN = 1.0
-
-MAX_WHEEL_SPEED_RAD_S = 25.0
-CMD_TIMEOUT_S = 0.5
-
-# Direct keyboard teleop for WebRTC users without shell/SSH access.
-# Set this to False later when ROS /cmd_vel should control the robot.
-ENABLE_WEBRTC_KEYBOARD_TELEOP = True
-KEYBOARD_LINEAR_SPEED_M_S = 0.30
-KEYBOARD_ANGULAR_SPEED_RAD_S = 0.80
-
-# Safety watchdog in case the browser loses a key-release event.
-KEYBOARD_EVENT_TIMEOUT_S = 1.25
+_BRIDGE_KEY = "_DRNAV_COMPACT_BRIDGE"
 
 
-# =============================================================================
-# MAIN BRIDGE CLASS
-# =============================================================================
+def move_toward(value: float, target: float, delta: float) -> float:
+    if value < target:
+        return min(value + delta, target)
+    return max(value - delta, target)
 
-class DRNavIsaacSim6Bridge:
+
+def wrap_angle(value: float) -> float:
+    return (value + math.pi) % (2.0 * math.pi) - math.pi
+
+
+class DRNavBridge:
     def __init__(self) -> None:
         self.stage = omni.usd.get_context().get_stage()
         self.timeline = omni.timeline.get_timeline_interface()
 
-        self._ros_node = None
-        self._cmd_subscription = None
-        self._tf_broadcaster = None
-        self._static_tf_broadcaster = None
+        self.ros_node = None
+        self.cmd_sub = None
+        self.scan_pub = None
+        self.points_pub = None
+        self.odom_pub = None
+        self.clock_pub = None
+        self.tf_pub = None
+        self.static_tf_pub = None
 
-        self._latest_linear = 0.0
-        self._latest_angular = 0.0
-        self._last_cmd_time = 0.0
+        self.lidar_interface = None
+        self.jackal = None
+        self.wheel_indices = None
+        self.physics_callback = None
 
-        self._input_interface = None
-        self._keyboard = None
-        self._keyboard_sub_id = None
-        self._pressed_keys = set()
-        self._last_keyboard_event_time = 0.0
+        self.input_interface = None
+        self.keyboard = None
+        self.keyboard_subscription = None
+        self.pressed_keys = set()
 
-        self._jackal = None
-        self._wheel_indices = None
-        self._physics_callback_id = None
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        self.last_cmd_time = 0.0
 
-        self._camera_render_products = []
-        self._lidar_render_product = None
-        self._lidar_sensor = None
-        self._lidar_pc_writer = None
-        self._lidar_scan_writer = None
-        self._lidar_debug_writer = None
+        self.current_linear = 0.0
+        self.current_angular = 0.0
 
-    # -------------------------------------------------------------------------
-    # Lifecycle
-    # -------------------------------------------------------------------------
+        self.last_odom_time = -1.0
+        self.last_lidar_time = -1.0
+        self.previous_pose_time = None
+        self.previous_position = None
+        self.previous_yaw = None
+
+        self.range_min = 0.05
+        self.range_max = 100.0
+        self.last_error_print = 0.0
+
+    # ------------------------------------------------------------------
+    # Startup and shutdown
+    # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        self._validate_required_prims()
-        await self._enable_extensions()
+        self.validate_scene()
+        await self.enable_extensions()
 
-        # Imports that depend on enabled Isaac Sim extensions.
         global Articulation, SimulationManager, IsaacEvents
-        global Lidar, set_target_prims
-        global rclpy, Twist, TransformStamped
+        global set_target_prims, _range_sensor
+        global rclpy, Twist, TransformStamped, Odometry, Clock
+        global LaserScan, PointCloud2, PointField
         global TransformBroadcaster, StaticTransformBroadcaster
 
         from isaacsim.core.experimental.prims import Articulation
         from isaacsim.core.nodes.scripts.utils import set_target_prims
         from isaacsim.core.simulation_manager import SimulationManager
-        from isaacsim.core.simulation_manager.impl.isaac_events import IsaacEvents
-        from isaacsim.sensors.experimental.rtx import Lidar
+        from isaacsim.core.simulation_manager.impl.isaac_events import (
+            IsaacEvents,
+        )
+        from isaacsim.sensors.physx import _range_sensor
 
         import rclpy
         from geometry_msgs.msg import TransformStamped, Twist
+        from nav_msgs.msg import Odometry
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import LaserScan, PointCloud2, PointField
         from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
-        self._cleanup_owned_scene_prims()
+        self.lidar_interface = _range_sensor.acquire_lidar_sensor_interface()
 
-        self._setup_camera_publishers()
-        self._setup_lidar_publishers()
-        self._setup_odom_and_clock_graph()
-        self._setup_ros_node()
+        await self.remove_runtime_graph()
+        self.disable_lidar_debug_view()
+        self.create_camera_graph()
+        self.create_ros_node()
 
-        if ENABLE_WEBRTC_KEYBOARD_TELEOP:
-            self._setup_keyboard_teleop()
+        if USE_WEBRTC_KEYBOARD:
+            self.create_keyboard_handler()
 
-        # Start physics before wrapping/querying the articulation.
         self.timeline.play()
-        for _ in range(5):
+
+        for _ in range(6):
             await omni.kit.app.get_app().next_update_async()
 
-        self._setup_jackal_articulation()
-        self._publish_static_sensor_transforms()
-        self._register_physics_callback()
+        self.create_articulation()
+        self.publish_static_transforms()
 
-        print("\n[DR.Nav] Isaac Sim 6.0 setup complete.")
-        print("[DR.Nav] Simulation is playing.")
-        self._print_verification_commands()
+        self.physics_callback = SimulationManager.register_callback(
+            self.physics_step,
+            IsaacEvents.POST_PHYSICS_STEP,
+        )
 
-    def shutdown(self) -> None:
-        """Best-effort cleanup for Script Editor re-runs."""
+        print("\n[DR.Nav] Compact setup complete.")
+        print("[DR.Nav] W/S = forward/reverse, A/D = turn, Space = stop.")
+        print("[DR.Nav] Runtime graph is session-layer-only.")
+
+    async def shutdown(self) -> None:
         try:
-            if self._physics_callback_id is not None:
-                SimulationManager.deregister_callback(self._physics_callback_id)
-                self._physics_callback_id = None
-        except Exception as exc:
-            print("[DR.Nav] Callback cleanup warning:", repr(exc))
+            self.timeline.stop()
+        except Exception:
+            pass
 
         try:
-            self._set_wheel_targets(0.0, 0.0)
+            if self.physics_callback is not None:
+                SimulationManager.deregister_callback(self.physics_callback)
+        except Exception:
+            pass
+
+        self.physics_callback = None
+
+        try:
+            self.set_wheel_targets(0.0, 0.0)
         except Exception:
             pass
 
         if (
-            self._input_interface is not None
-            and self._keyboard is not None
-            and self._keyboard_sub_id is not None
+            self.input_interface is not None
+            and self.keyboard is not None
+            and self.keyboard_subscription is not None
         ):
             try:
-                self._input_interface.unsubscribe_to_keyboard_events(
-                    self._keyboard,
-                    self._keyboard_sub_id,
+                self.input_interface.unsubscribe_to_keyboard_events(
+                    self.keyboard,
+                    self.keyboard_subscription,
                 )
-            except Exception as exc:
-                print("[DR.Nav] Keyboard cleanup warning:", repr(exc))
-
-        self._keyboard_sub_id = None
-        self._pressed_keys.clear()
-
-        for writer in [
-            self._lidar_pc_writer,
-            self._lidar_scan_writer,
-            self._lidar_debug_writer,
-        ]:
-            if writer is not None:
-                try:
-                    writer.detach()
-                except Exception:
-                    pass
-
-        for render_product in self._camera_render_products:
-            try:
-                render_product.destroy()
             except Exception:
                 pass
 
-        if self._lidar_render_product is not None:
+        self.keyboard_subscription = None
+        self.pressed_keys.clear()
+
+        if self.ros_node is not None:
             try:
-                self._lidar_render_product.destroy()
+                self.ros_node.destroy_node()
             except Exception:
                 pass
 
-        if self._ros_node is not None:
-            try:
-                self._ros_node.destroy_node()
-            except Exception:
-                pass
-            self._ros_node = None
+        self.ros_node = None
 
-        print("[DR.Nav] Previous bridge cleaned up.")
+        for _ in range(2):
+            await omni.kit.app.get_app().next_update_async()
 
-    # -------------------------------------------------------------------------
-    # Validation and extensions
-    # -------------------------------------------------------------------------
+        await self.remove_runtime_graph()
+        print("[DR.Nav] Previous compact bridge cleaned up.")
 
-    def _validate_required_prims(self) -> None:
-        required = {
-            "Jackal": ROBOT_PRIM,
-            "base_link": BASE_LINK_PATH,
-            "left Bumblebee camera": LEFT_CAMERA_PATH,
-            "left Bumblebee frame": LEFT_CAMERA_FRAME_PATH,
-            "LiDAR mount frame": LIDAR_FRAME_PATH,
-        }
+    # ------------------------------------------------------------------
+    # Scene and extensions
+    # ------------------------------------------------------------------
 
-        if PUBLISH_RIGHT_STEREO_CAMERA:
-            required["right Bumblebee camera"] = RIGHT_CAMERA_PATH
-            required["right Bumblebee frame"] = RIGHT_CAMERA_FRAME_PATH
-
+    def validate_scene(self) -> None:
+        required = [ROBOT, BASE_LINK, CAMERA_FRAME, CAMERA, LIDAR_FRAME, LIDAR]
         missing = [
-            f"{name}: {path}"
-            for name, path in required.items()
+            path
+            for path in required
             if not self.stage.GetPrimAtPath(path).IsValid()
         ]
 
         if missing:
             raise RuntimeError(
-                "The following required prim paths were not found:\n  "
-                + "\n  ".join(missing)
+                "Missing required scene prims:\n  " + "\n  ".join(missing)
             )
 
-    async def _enable_extensions(self) -> None:
+        lidar_prim = self.stage.GetPrimAtPath(LIDAR)
+
+        if not lidar_prim.IsActive():
+            raise RuntimeError(f"Existing LiDAR is inactive: {LIDAR}")
+
+        if lidar_prim.GetTypeName() != "Lidar":
+            raise RuntimeError(
+                f"Expected PhysX Lidar at {LIDAR}, "
+                f"found type {lidar_prim.GetTypeName()!r}."
+            )
+
+    async def enable_extensions(self) -> None:
         manager = omni.kit.app.get_app().get_extension_manager()
 
-        extension_ids = [
+        for extension_id in [
             "isaacsim.core.nodes",
             "isaacsim.ros2.bridge",
             "isaacsim.ros2.nodes",
-            "isaacsim.sensors.experimental.rtx",
-            "isaacsim.sensors.rtx.nodes",
-        ]
-
-        for extension_id in extension_ids:
+            "isaacsim.sensors.physx",
+        ]:
             if not manager.is_extension_enabled(extension_id):
                 manager.set_extension_enabled_immediate(extension_id, True)
-                print(f"[DR.Nav] Enabled extension: {extension_id}")
-            else:
-                print(f"[DR.Nav] Extension already enabled: {extension_id}")
 
-        # Give Kit a few updates to finish loading Python modules and OGN nodes.
         for _ in range(3):
             await omni.kit.app.get_app().next_update_async()
 
-    def _cleanup_owned_scene_prims(self) -> None:
-        # Only remove prims owned by this script. Existing Jackal cameras,
-        # zones, walls, and robot prims are not touched.
-        for path in [GRAPH_PATH, LIDAR_SENSOR_PATH]:
-            if self.stage.GetPrimAtPath(path).IsValid():
-                self.stage.RemovePrim(path)
-                print(f"[DR.Nav] Removed prior generated prim: {path}")
-
-    # -------------------------------------------------------------------------
-    # Camera
-    # -------------------------------------------------------------------------
-
-    def _setup_camera_publishers(self) -> None:
-        left_rp = rep.create.render_product(
-            LEFT_CAMERA_PATH,
-            CAMERA_RESOLUTION,
-            name="DRNavLeftCamera",
+    def session_target(self):
+        return self.stage.GetEditTargetForLocalLayer(
+            self.stage.GetSessionLayer()
         )
-        self._camera_render_products.append(left_rp)
 
-        camera_specs = [
-            (
-                "camera_left",
-                left_rp.path,
-                TOPIC_FRONT_RGB,
-                FRAME_LEFT_CAMERA,
+    async def remove_runtime_graph(self) -> None:
+        with Usd.EditContext(self.stage, self.session_target()):
+            if self.stage.GetPrimAtPath(RUNTIME_GRAPH).IsValid():
+                self.stage.RemovePrim(RUNTIME_GRAPH)
+
+        for _ in range(2):
+            await omni.kit.app.get_app().next_update_async()
+
+    def disable_lidar_debug_view(self) -> None:
+        lidar_prim = self.stage.GetPrimAtPath(LIDAR)
+
+        with Usd.EditContext(self.stage, self.session_target()):
+            for attribute in lidar_prim.GetAttributes():
+                name = attribute.GetName().lower()
+
+                if (
+                    name.endswith("drawlines")
+                    or name.endswith("drawpoints")
+                    or name.endswith("showdebugview")
+                ):
+                    attribute.Set(False)
+
+        self.range_min = self.find_numeric_attribute("minrange", 0.05)
+        self.range_max = self.find_numeric_attribute("maxrange", 100.0)
+
+    def find_numeric_attribute(self, suffix: str, fallback: float) -> float:
+        prim = self.stage.GetPrimAtPath(LIDAR)
+
+        for attribute in prim.GetAttributes():
+            if attribute.GetName().lower().endswith(suffix):
+                value = attribute.Get()
+                if value is not None:
+                    return float(value)
+
+        return fallback
+
+    # ------------------------------------------------------------------
+    # Camera graph
+    # ------------------------------------------------------------------
+
+    def create_camera_graph(self) -> None:
+        with Usd.EditContext(self.stage, self.session_target()):
+            og.Controller.edit(
+                {
+                    "graph_path": RUNTIME_GRAPH,
+                    "evaluator_name": "execution",
+                    "pipeline_stage": (
+                        og.GraphPipelineStage
+                        .GRAPH_PIPELINE_STAGE_SIMULATION
+                    ),
+                },
+                {
+                    og.Controller.Keys.CREATE_NODES: [
+                        ("tick", "omni.graph.action.OnPlaybackTick"),
+                        (
+                            "context",
+                            "isaacsim.ros2.bridge.ROS2Context",
+                        ),
+                        (
+                            "once",
+                            "isaacsim.core.nodes."
+                            "OgnIsaacRunOneSimulationFrame",
+                        ),
+                        (
+                            "render_product",
+                            "isaacsim.core.nodes."
+                            "IsaacCreateRenderProduct",
+                        ),
+                        (
+                            "camera",
+                            "isaacsim.ros2.bridge.ROS2CameraHelper",
+                        ),
+                    ],
+                    og.Controller.Keys.CONNECT: [
+                        ("tick.outputs:tick", "once.inputs:execIn"),
+                        (
+                            "once.outputs:step",
+                            "render_product.inputs:execIn",
+                        ),
+                        (
+                            "render_product.outputs:execOut",
+                            "camera.inputs:execIn",
+                        ),
+                        (
+                            "render_product.outputs:renderProductPath",
+                            "camera.inputs:renderProductPath",
+                        ),
+                        (
+                            "context.outputs:context",
+                            "camera.inputs:context",
+                        ),
+                    ],
+                    og.Controller.Keys.SET_VALUES: [
+                        ("context.inputs:useDomainIDEnvVar", True),
+                        (
+                            "render_product.inputs:width",
+                            CAMERA_RESOLUTION[0],
+                        ),
+                        (
+                            "render_product.inputs:height",
+                            CAMERA_RESOLUTION[1],
+                        ),
+                        ("camera.inputs:topicName", TOPIC_IMAGE),
+                        ("camera.inputs:frameId", FRAME_CAMERA),
+                        ("camera.inputs:type", "rgb"),
+                        ("camera.inputs:enabled", True),
+                    ],
+                },
             )
-        ]
 
-        if PUBLISH_RIGHT_STEREO_CAMERA:
-            right_rp = rep.create.render_product(
-                RIGHT_CAMERA_PATH,
-                CAMERA_RESOLUTION,
-                name="DRNavRightCamera",
-            )
-            self._camera_render_products.append(right_rp)
-            camera_specs.append(
-                (
-                    "camera_right",
-                    right_rp.path,
-                    TOPIC_RIGHT_RGB,
-                    FRAME_RIGHT_CAMERA,
-                )
+            set_target_prims(
+                primPath=f"{RUNTIME_GRAPH}/render_product",
+                inputName="inputs:cameraPrim",
+                targetPrimPaths=[CAMERA],
             )
 
-        self._camera_specs = camera_specs
+        graph = self.stage.GetPrimAtPath(RUNTIME_GRAPH)
+        session_id = self.stage.GetSessionLayer().identifier
+        authored_layers = {
+            spec.layer.identifier for spec in graph.GetPrimStack()
+        }
 
-        print("[DR.Nav] Camera render products:")
-        for _, rp_path, topic, frame_id in camera_specs:
-            print(f"  {rp_path} -> {topic} [{frame_id}]")
-
-    # -------------------------------------------------------------------------
-    # LiDAR
-    # -------------------------------------------------------------------------
-
-    def _setup_lidar_publishers(self) -> None:
-        # The uploaded Jackal scene authors sick_lms1xx_lidar_frame as
-        # active=false. USD does not allow a child prim beneath an inactive
-        # parent, so reactivate the mount before creating the RTX LiDAR.
-        lidar_mount_prim = self.stage.GetPrimAtPath(LIDAR_FRAME_PATH)
-
-        if not lidar_mount_prim.IsValid():
+        if session_id not in authored_layers:
             raise RuntimeError(
-                f"LiDAR mount frame was not found: {LIDAR_FRAME_PATH}"
+                "Runtime graph was not created in the USD session layer."
             )
 
-        if not lidar_mount_prim.IsActive():
-            lidar_mount_prim.SetActive(True)
-            print(
-                "[DR.Nav] Reactivated inactive LiDAR mount frame: "
-                f"{LIDAR_FRAME_PATH}"
-            )
+    # ------------------------------------------------------------------
+    # ROS
+    # ------------------------------------------------------------------
 
-        self._lidar_sensor = Lidar.create(
-            path=LIDAR_SENSOR_PATH,
-            config=LIDAR_CONFIG,
-            tick_rate=LIDAR_TICK_RATE_HZ,
-            translations=[[0.0, 0.0, 0.0]],
-            orientations=[[1.0, 0.0, 0.0, 0.0]],
-        )
-
-        # Do not create or attach the LiDAR render product here. In Script
-        # Editor, direct Replicator attachment can race the RTX sensor pipeline
-        # and leave stale annotator state after reruns. The Action Graph below
-        # creates the render product exactly once, following NVIDIA's 6.0
-        # reference graph.
-        self._lidar_render_product = None
-
-        print(
-            f"[DR.Nav] RTX LiDAR created: {LIDAR_SENSOR_PATH} "
-            f"({LIDAR_CONFIG}, {LIDAR_TICK_RATE_HZ:g} Hz)"
-        )
-
-    # -------------------------------------------------------------------------
-    # ROS camera, scan, odometry, and clock graph
-    # -------------------------------------------------------------------------
-
-    def _setup_odom_and_clock_graph(self) -> None:
-        create_nodes = [
-            ("tick", "omni.graph.action.OnPlaybackTick"),
-            (
-                "lidar_once",
-                "isaacsim.core.nodes.OgnIsaacRunOneSimulationFrame",
-            ),
-            (
-                "lidar_render_product",
-                "isaacsim.core.nodes.IsaacCreateRenderProduct",
-            ),
-            (
-                "lidar_pointcloud",
-                "isaacsim.ros2.bridge.ROS2RtxLidarHelper",
-            ),
-            ("simtime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
-            ("odomcompute", "isaacsim.core.nodes.IsaacComputeOdometry"),
-            ("odompub", "isaacsim.ros2.bridge.ROS2PublishOdometry"),
-            ("clock", "isaacsim.ros2.bridge.ROS2PublishClock"),
-        ]
-
-        connections = [
-            ("tick.outputs:tick", "lidar_once.inputs:execIn"),
-            (
-                "lidar_once.outputs:step",
-                "lidar_render_product.inputs:execIn",
-            ),
-            (
-                "lidar_render_product.outputs:execOut",
-                "lidar_pointcloud.inputs:execIn",
-            ),
-            (
-                "lidar_render_product.outputs:renderProductPath",
-                "lidar_pointcloud.inputs:renderProductPath",
-            ),
-            ("tick.outputs:tick", "odomcompute.inputs:execIn"),
-            ("tick.outputs:tick", "odompub.inputs:execIn"),
-            ("tick.outputs:tick", "clock.inputs:execIn"),
-            ("simtime.outputs:simulationTime", "odompub.inputs:timeStamp"),
-            ("simtime.outputs:simulationTime", "clock.inputs:timeStamp"),
-            ("odomcompute.outputs:position", "odompub.inputs:position"),
-            (
-                "odomcompute.outputs:orientation",
-                "odompub.inputs:orientation",
-            ),
-            (
-                "odomcompute.outputs:linearVelocity",
-                "odompub.inputs:linearVelocity",
-            ),
-            (
-                "odomcompute.outputs:angularVelocity",
-                "odompub.inputs:angularVelocity",
-            ),
-        ]
-
-        set_values = [
-            ("lidar_render_product.inputs:width", 1),
-            ("lidar_render_product.inputs:height", 1),
-            (
-                "lidar_pointcloud.inputs:topicName",
-                TOPIC_POINT_CLOUD,
-            ),
-            ("lidar_pointcloud.inputs:frameId", FRAME_LIDAR),
-            ("lidar_pointcloud.inputs:type", "point_cloud"),
-            ("lidar_pointcloud.inputs:showDebugView", False),
-            ("odompub.inputs:topicName", TOPIC_ODOM),
-            ("odompub.inputs:chassisFrameId", FRAME_BASE),
-            ("odompub.inputs:odomFrameId", FRAME_ODOM),
-            ("odompub.inputs:robotFront", [1.0, 0.0, 0.0]),
-        ]
-
-        for node_name, rp_path, topic_name, frame_id in self._camera_specs:
-            create_nodes.append(
-                (node_name, "isaacsim.ros2.bridge.ROS2CameraHelper")
-            )
-            connections.append(
-                ("tick.outputs:tick", f"{node_name}.inputs:execIn")
-            )
-            set_values.extend(
-                [
-                    (f"{node_name}.inputs:renderProductPath", rp_path),
-                    (f"{node_name}.inputs:topicName", topic_name),
-                    (f"{node_name}.inputs:frameId", frame_id),
-                    (f"{node_name}.inputs:type", "rgb"),
-                ]
-            )
-
-        og.Controller.edit(
-            {
-                "graph_path": GRAPH_PATH,
-                "evaluator_name": "execution",
-                "pipeline_stage": (
-                    og.GraphPipelineStage.GRAPH_PIPELINE_STAGE_SIMULATION
-                ),
-            },
-            {
-                og.Controller.Keys.CREATE_NODES: create_nodes,
-                og.Controller.Keys.CONNECT: connections,
-                og.Controller.Keys.SET_VALUES: set_values,
-            },
-        )
-
-        set_target_prims(
-            primPath=f"{GRAPH_PATH}/lidar_render_product",
-            inputName="inputs:cameraPrim",
-            targetPrimPaths=[LIDAR_SENSOR_PATH],
-        )
-
-        set_target_prims(
-            primPath=f"{GRAPH_PATH}/odomcompute",
-            inputName="inputs:chassisPrim",
-            targetPrimPaths=[BASE_LINK_PATH],
-        )
-
-        print(
-            "[DR.Nav] ROS 2 Action Graph created with official one-frame "
-            "RTX LiDAR render-product bootstrap."
-        )
-
-    # -------------------------------------------------------------------------
-    # ROS node and TF
-    # -------------------------------------------------------------------------
-
-    def _setup_ros_node(self) -> None:
+    def create_ros_node(self) -> None:
         if not rclpy.ok():
             rclpy.init()
 
-        self._ros_node = rclpy.create_node("drnav_jackal_isaacsim6")
-        self._cmd_subscription = self._ros_node.create_subscription(
+        self.ros_node = rclpy.create_node("drnav_jackal_compact")
+
+        self.cmd_sub = self.ros_node.create_subscription(
             Twist,
             TOPIC_CMD_VEL,
-            self._cmd_vel_callback,
+            self.cmd_vel_callback,
             10,
         )
 
-        self._tf_broadcaster = TransformBroadcaster(self._ros_node)
-        self._static_tf_broadcaster = StaticTransformBroadcaster(
-            self._ros_node
+        self.scan_pub = self.ros_node.create_publisher(
+            LaserScan,
+            TOPIC_SCAN,
+            10,
+        )
+        self.points_pub = self.ros_node.create_publisher(
+            PointCloud2,
+            TOPIC_POINTS,
+            10,
+        )
+        self.odom_pub = self.ros_node.create_publisher(
+            Odometry,
+            TOPIC_ODOM,
+            10,
+        )
+        self.clock_pub = self.ros_node.create_publisher(
+            Clock,
+            TOPIC_CLOCK,
+            10,
         )
 
-        self._last_cmd_time = time.monotonic()
-        print(f"[DR.Nav] Subscribed to {TOPIC_CMD_VEL}")
+        self.tf_pub = TransformBroadcaster(self.ros_node)
+        self.static_tf_pub = StaticTransformBroadcaster(self.ros_node)
 
-    def _cmd_vel_callback(self, message) -> None:
-        self._latest_linear = float(message.linear.x)
-        self._latest_angular = float(message.angular.z)
-        self._last_cmd_time = time.monotonic()
+        self.last_cmd_time = time.monotonic()
 
-    def _sim_stamp(self):
-        current_time = float(self.timeline.get_current_time())
-        sec = int(math.floor(current_time))
-        nanosec = int((current_time - sec) * 1_000_000_000)
-        return sec, nanosec
+    def cmd_vel_callback(self, message) -> None:
+        self.cmd_linear = float(message.linear.x)
+        self.cmd_angular = float(message.angular.z)
+        self.last_cmd_time = time.monotonic()
 
-    def _matrix_to_transform(
-        self,
-        matrix,
-        parent_frame: str,
-        child_frame: str,
-    ):
-        transform = TransformStamped()
-        sec, nanosec = self._sim_stamp()
+    def sim_time(self) -> float:
+        return float(self.timeline.get_current_time())
 
-        transform.header.stamp.sec = sec
-        transform.header.stamp.nanosec = nanosec
-        transform.header.frame_id = parent_frame
-        transform.child_frame_id = child_frame
+    @staticmethod
+    def set_stamp(stamp, value: float) -> None:
+        seconds = int(math.floor(value))
+        stamp.sec = seconds
+        stamp.nanosec = int((value - seconds) * 1_000_000_000)
 
-        translation = matrix.ExtractTranslation()
-        rotation = matrix.ExtractRotationQuat()
-        imaginary = rotation.GetImaginary()
+    # ------------------------------------------------------------------
+    # Keyboard
+    # ------------------------------------------------------------------
 
-        transform.transform.translation.x = float(translation[0])
-        transform.transform.translation.y = float(translation[1])
-        transform.transform.translation.z = float(translation[2])
-
-        transform.transform.rotation.x = float(imaginary[0])
-        transform.transform.rotation.y = float(imaginary[1])
-        transform.transform.rotation.z = float(imaginary[2])
-        transform.transform.rotation.w = float(rotation.GetReal())
-
-        return transform
-
-    def _publish_static_sensor_transforms(self) -> None:
-        cache = UsdGeom.XformCache(Usd.TimeCode.Default())
-        base_prim = self.stage.GetPrimAtPath(BASE_LINK_PATH)
-
-        sensor_frames = [
-            (LEFT_CAMERA_FRAME_PATH, FRAME_LEFT_CAMERA),
-            (LIDAR_FRAME_PATH, FRAME_LIDAR),
-        ]
-        if PUBLISH_RIGHT_STEREO_CAMERA:
-            sensor_frames.append(
-                (RIGHT_CAMERA_FRAME_PATH, FRAME_RIGHT_CAMERA)
-            )
-
-        transforms = []
-
-        for prim_path, frame_id in sensor_frames:
-            sensor_prim = self.stage.GetPrimAtPath(prim_path)
-            try:
-                relative_matrix, _ = cache.ComputeRelativeTransform(
-                    sensor_prim,
-                    base_prim,
-                )
-                transforms.append(
-                    self._matrix_to_transform(
-                        relative_matrix,
-                        FRAME_BASE,
-                        frame_id,
-                    )
-                )
-            except Exception as exc:
-                print(
-                    f"[DR.Nav] Static TF warning for {prim_path}: "
-                    f"{exc!r}"
-                )
-
-        if transforms:
-            self._static_tf_broadcaster.sendTransform(transforms)
-            print(
-                "[DR.Nav] Published static sensor TFs:",
-                ", ".join(t.child_frame_id for t in transforms),
-            )
-
-    # -------------------------------------------------------------------------
-    # Direct WebRTC keyboard teleoperation
-    # -------------------------------------------------------------------------
-
-    def _setup_keyboard_teleop(self) -> None:
+    def create_keyboard_handler(self) -> None:
         app_window = omni.appwindow.get_default_app_window()
 
         if app_window is None:
-            raise RuntimeError(
-                "Isaac Sim's default application window was not available."
-            )
+            raise RuntimeError("Default Isaac Sim app window is unavailable.")
 
-        self._keyboard = app_window.get_keyboard()
-        self._input_interface = carb.input.acquire_input_interface()
-        self._keyboard_sub_id = (
-            self._input_interface.subscribe_to_keyboard_events(
-                self._keyboard,
-                self._on_keyboard_event,
+        self.keyboard = app_window.get_keyboard()
+        self.input_interface = carb.input.acquire_input_interface()
+        self.keyboard_subscription = (
+            self.input_interface.subscribe_to_keyboard_events(
+                self.keyboard,
+                self.keyboard_event,
             )
         )
-        self._last_keyboard_event_time = time.monotonic()
 
-        print("[DR.Nav] WebRTC keyboard teleop enabled.")
-        print("[DR.Nav] Click the 3D viewport, then hold:")
-        print("         W = forward, S = reverse")
-        print("         A = turn left, D = turn right")
-        print("         SPACE = immediate stop")
-
-    def _on_keyboard_event(self, event) -> bool:
-        handled_keys = {
+    def keyboard_event(self, event) -> bool:
+        handled = {
             carb.input.KeyboardInput.W,
             carb.input.KeyboardInput.A,
             carb.input.KeyboardInput.S,
@@ -688,241 +522,445 @@ class DRNavIsaacSim6Bridge:
             carb.input.KeyboardInput.SPACE,
         }
 
-        if event.input not in handled_keys:
+        if event.input not in handled:
             return False
-
-        self._last_keyboard_event_time = time.monotonic()
 
         if event.input == carb.input.KeyboardInput.SPACE:
             if event.type in (
                 carb.input.KeyboardEventType.KEY_PRESS,
                 carb.input.KeyboardEventType.KEY_REPEAT,
             ):
-                self._pressed_keys.clear()
-                self._set_wheel_targets(0.0, 0.0)
+                self.pressed_keys.clear()
+                self.current_linear = 0.0
+                self.current_angular = 0.0
+                self.set_wheel_targets(0.0, 0.0)
             return True
 
         if event.type in (
             carb.input.KeyboardEventType.KEY_PRESS,
             carb.input.KeyboardEventType.KEY_REPEAT,
         ):
-            self._pressed_keys.add(event.input)
+            self.pressed_keys.add(event.input)
         elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
-            self._pressed_keys.discard(event.input)
+            self.pressed_keys.discard(event.input)
 
-        # Consume handled keys so they are not typed into text fields.
         return True
 
-    def _get_keyboard_command(self):
-        # Stop safely if WebRTC/browser focus changes and a release event is lost.
-        if (
-            self._pressed_keys
-            and time.monotonic() - self._last_keyboard_event_time
-            > KEYBOARD_EVENT_TIMEOUT_S
-        ):
-            self._pressed_keys.clear()
-
+    def keyboard_command(self) -> Tuple[float, float]:
         linear = 0.0
         angular = 0.0
 
-        if carb.input.KeyboardInput.W in self._pressed_keys:
-            linear += KEYBOARD_LINEAR_SPEED_M_S
-        if carb.input.KeyboardInput.S in self._pressed_keys:
-            linear -= KEYBOARD_LINEAR_SPEED_M_S
-        if carb.input.KeyboardInput.A in self._pressed_keys:
-            angular += KEYBOARD_ANGULAR_SPEED_RAD_S
-        if carb.input.KeyboardInput.D in self._pressed_keys:
-            angular -= KEYBOARD_ANGULAR_SPEED_RAD_S
+        if carb.input.KeyboardInput.W in self.pressed_keys:
+            linear += LINEAR_SPEED
+        if carb.input.KeyboardInput.S in self.pressed_keys:
+            linear -= LINEAR_SPEED
+        if carb.input.KeyboardInput.A in self.pressed_keys:
+            angular += ANGULAR_SPEED
+        if carb.input.KeyboardInput.D in self.pressed_keys:
+            angular -= ANGULAR_SPEED
 
         return linear, angular
 
-    # -------------------------------------------------------------------------
-    # Jackal articulation and physics callback
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Articulation
+    # ------------------------------------------------------------------
 
-    def _setup_jackal_articulation(self) -> None:
-        self._jackal = Articulation(ROBOT_PRIM)
+    def create_articulation(self) -> None:
+        self.jackal = Articulation(ROBOT)
+        self.wheel_indices = self.jackal.get_dof_indices(
+            WHEEL_JOINTS
+        ).numpy()
 
-        print("[DR.Nav] Available Jackal DOFs:")
-        print(" ", self._jackal.dof_names)
+        print("[DR.Nav] Wheel indices:", self.wheel_indices)
 
-        try:
-            indices = self._jackal.get_dof_indices(
-                WHEEL_JOINT_NAMES
-            ).numpy()
-        except Exception as exc:
-            raise RuntimeError(
-                "Could not resolve the configured Jackal wheel joints.\n"
-                f"Configured names: {WHEEL_JOINT_NAMES}\n"
-                f"Available DOFs: {self._jackal.dof_names}"
-            ) from exc
-
-        self._wheel_indices = indices
-        print("[DR.Nav] Wheel joint names:", WHEEL_JOINT_NAMES)
-        print("[DR.Nav] Wheel DOF indices:", self._wheel_indices)
-
-    def _register_physics_callback(self) -> None:
-        self._physics_callback_id = SimulationManager.register_callback(
-            self._physics_step,
-            IsaacEvents.POST_PHYSICS_STEP,
-        )
-        print("[DR.Nav] Registered Isaac Sim 6.0 physics callback.")
-
-    def _physics_step(self, dt, context) -> None:
-        del dt, context
-
-        try:
-            rclpy.spin_once(self._ros_node, timeout_sec=0.0)
-
-            if ENABLE_WEBRTC_KEYBOARD_TELEOP:
-                linear, angular = self._get_keyboard_command()
-            elif time.monotonic() - self._last_cmd_time > CMD_TIMEOUT_S:
-                linear = 0.0
-                angular = 0.0
-            else:
-                linear = self._latest_linear
-                angular = self._latest_angular
-
-            self._set_wheel_targets(linear, angular)
-            self._publish_dynamic_base_tf()
-
-        except Exception as exc:
-            # Avoid crashing the simulation callback. Print sparingly.
-            print("[DR.Nav] Physics callback error:", repr(exc))
-
-    def _set_wheel_targets(
-        self,
-        linear_m_s: float,
-        angular_rad_s: float,
-    ) -> None:
-        if self._jackal is None or self._wheel_indices is None:
+    def set_wheel_targets(self, linear: float, angular: float) -> None:
+        if self.jackal is None or self.wheel_indices is None:
             return
 
-        half_track = TRACK_WIDTH_M / 2.0
+        half_track = TRACK_WIDTH / 2.0
 
-        left_rad_s = (
-            linear_m_s - angular_rad_s * half_track
-        ) / WHEEL_RADIUS_M
+        left = (
+            linear - angular * half_track
+        ) / WHEEL_RADIUS
+        right = (
+            linear + angular * half_track
+        ) / WHEEL_RADIUS
 
-        right_rad_s = (
-            linear_m_s + angular_rad_s * half_track
-        ) / WHEEL_RADIUS_M
+        left *= LEFT_WHEEL_SIGN
+        right *= RIGHT_WHEEL_SIGN
 
-        left_rad_s *= LEFT_WHEEL_SIGN
-        right_rad_s *= RIGHT_WHEEL_SIGN
+        left = float(np.clip(left, -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED))
+        right = float(np.clip(right, -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED))
 
-        left_rad_s = float(
-            np.clip(
-                left_rad_s,
-                -MAX_WHEEL_SPEED_RAD_S,
-                MAX_WHEEL_SPEED_RAD_S,
-            )
-        )
-        right_rad_s = float(
-            np.clip(
-                right_rad_s,
-                -MAX_WHEEL_SPEED_RAD_S,
-                MAX_WHEEL_SPEED_RAD_S,
-            )
-        )
-
-        wheel_velocities = np.array(
-            [[left_rad_s, right_rad_s, left_rad_s, right_rad_s]],
+        velocities = np.array(
+            [[left, right, left, right]],
             dtype=np.float32,
         )
 
-        self._jackal.set_dof_velocity_targets(
-            wheel_velocities,
-            dof_indices=self._wheel_indices,
+        self.jackal.set_dof_velocity_targets(
+            velocities,
+            dof_indices=self.wheel_indices,
         )
 
-    def _publish_dynamic_base_tf(self) -> None:
+    # ------------------------------------------------------------------
+    # TF, clock and odometry
+    # ------------------------------------------------------------------
+
+    def publish_static_transforms(self) -> None:
         cache = UsdGeom.XformCache(Usd.TimeCode.Default())
-        base_prim = self.stage.GetPrimAtPath(BASE_LINK_PATH)
-        world_matrix = cache.GetLocalToWorldTransform(base_prim)
+        base_prim = self.stage.GetPrimAtPath(BASE_LINK)
 
-        transform = self._matrix_to_transform(
-            world_matrix,
-            FRAME_ODOM,
-            FRAME_BASE,
+        transforms = []
+
+        for path, frame in [
+            (CAMERA_FRAME, FRAME_CAMERA),
+            (LIDAR, FRAME_LIDAR),
+        ]:
+            prim = self.stage.GetPrimAtPath(path)
+            matrix, _ = cache.ComputeRelativeTransform(prim, base_prim)
+            transforms.append(
+                self.matrix_to_transform(
+                    matrix,
+                    FRAME_BASE,
+                    frame,
+                    self.sim_time(),
+                )
+            )
+
+        self.static_tf_pub.sendTransform(transforms)
+
+    def matrix_to_transform(
+        self,
+        matrix,
+        parent: str,
+        child: str,
+        sim_time: float,
+    ):
+        message = TransformStamped()
+        self.set_stamp(message.header.stamp, sim_time)
+        message.header.frame_id = parent
+        message.child_frame_id = child
+
+        translation = matrix.ExtractTranslation()
+        rotation = matrix.ExtractRotationQuat()
+        imaginary = rotation.GetImaginary()
+
+        message.transform.translation.x = float(translation[0])
+        message.transform.translation.y = float(translation[1])
+        message.transform.translation.z = float(translation[2])
+
+        message.transform.rotation.x = float(imaginary[0])
+        message.transform.rotation.y = float(imaginary[1])
+        message.transform.rotation.z = float(imaginary[2])
+        message.transform.rotation.w = float(rotation.GetReal())
+
+        return message
+
+    def publish_clock(self, sim_time: float) -> None:
+        message = Clock()
+        self.set_stamp(message.clock, sim_time)
+        self.clock_pub.publish(message)
+
+    def publish_odom(self, sim_time: float) -> None:
+        cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+        matrix = cache.GetLocalToWorldTransform(
+            self.stage.GetPrimAtPath(BASE_LINK)
         )
-        self._tf_broadcaster.sendTransform(transform)
 
-    # -------------------------------------------------------------------------
-    # User instructions
-    # -------------------------------------------------------------------------
+        translation = matrix.ExtractTranslation()
+        rotation = matrix.ExtractRotationQuat()
+        imaginary = rotation.GetImaginary()
+
+        x = float(translation[0])
+        y = float(translation[1])
+        z = float(translation[2])
+
+        qx = float(imaginary[0])
+        qy = float(imaginary[1])
+        qz = float(imaginary[2])
+        qw = float(rotation.GetReal())
+
+        yaw = math.atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy * qy + qz * qz),
+        )
+
+        vx_body = 0.0
+        vy_body = 0.0
+        wz = 0.0
+
+        if self.previous_pose_time is not None:
+            dt = sim_time - self.previous_pose_time
+
+            if dt > 1e-6:
+                vx_world = (x - self.previous_position[0]) / dt
+                vy_world = (y - self.previous_position[1]) / dt
+
+                cos_yaw = math.cos(yaw)
+                sin_yaw = math.sin(yaw)
+
+                vx_body = cos_yaw * vx_world + sin_yaw * vy_world
+                vy_body = -sin_yaw * vx_world + cos_yaw * vy_world
+                wz = wrap_angle(yaw - self.previous_yaw) / dt
+
+        self.previous_pose_time = sim_time
+        self.previous_position = (x, y, z)
+        self.previous_yaw = yaw
+
+        transform = TransformStamped()
+        self.set_stamp(transform.header.stamp, sim_time)
+        transform.header.frame_id = FRAME_ODOM
+        transform.child_frame_id = FRAME_BASE
+        transform.transform.translation.x = x
+        transform.transform.translation.y = y
+        transform.transform.translation.z = z
+        transform.transform.rotation.x = qx
+        transform.transform.rotation.y = qy
+        transform.transform.rotation.z = qz
+        transform.transform.rotation.w = qw
+        self.tf_pub.sendTransform(transform)
+
+        odom = Odometry()
+        self.set_stamp(odom.header.stamp, sim_time)
+        odom.header.frame_id = FRAME_ODOM
+        odom.child_frame_id = FRAME_BASE
+
+        odom.pose.pose.position.x = x
+        odom.pose.pose.position.y = y
+        odom.pose.pose.position.z = z
+        odom.pose.pose.orientation.x = qx
+        odom.pose.pose.orientation.y = qy
+        odom.pose.pose.orientation.z = qz
+        odom.pose.pose.orientation.w = qw
+
+        odom.twist.twist.linear.x = vx_body
+        odom.twist.twist.linear.y = vy_body
+        odom.twist.twist.angular.z = wz
+
+        self.odom_pub.publish(odom)
+
+    # ------------------------------------------------------------------
+    # PhysX LiDAR
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _print_verification_commands() -> None:
-        print(
-            f"""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Verify ROS topics from a ROS 2 terminal:
+    def radians(values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float32)
+        finite = values[np.isfinite(values)]
 
-  ros2 topic list
-  ros2 topic hz {TOPIC_FRONT_RGB}
-  ros2 topic hz {TOPIC_POINT_CLOUD}
-  ros2 topic hz {TOPIC_ODOM}
+        if finite.size and np.max(np.abs(finite)) > 2.0 * math.pi + 0.1:
+            return np.deg2rad(values)
 
-Note: /scan is intentionally not created in v5. NVIDIA's 6.0 reference
-uses a separate Example_Rotary_2D sensor for LaserScan. The 3D point
-cloud remains available on /os_cloud_node/points.
+        return values
 
-Verify transforms:
+    def planar_scan(self, depth, azimuth, zenith):
+        depth = np.asarray(depth, dtype=np.float32)
+        azimuth = self.radians(np.asarray(azimuth, dtype=np.float32))
+        zenith = self.radians(np.asarray(zenith, dtype=np.float32))
 
-  ros2 run tf2_ros tf2_echo {FRAME_ODOM} {FRAME_BASE}
-  ros2 run tf2_ros tf2_echo {FRAME_BASE} {FRAME_LEFT_CAMERA}
-  ros2 run tf2_ros tf2_echo {FRAME_BASE} {FRAME_LIDAR}
+        if depth.size == 0 or azimuth.size == 0:
+            return np.empty(0), np.empty(0)
 
-Drive the Jackal directly through WebRTC:
+        if depth.ndim >= 2:
+            depth = depth.reshape(depth.shape[0], -1)
 
-  1. Click inside the 3D viewport.
-  2. Hold W/S for forward/reverse.
-  3. Hold A/D to rotate left/right.
-  4. Press SPACE to stop immediately.
+            if zenith.ndim == 1 and zenith.size == depth.shape[0]:
+                row = int(np.argmin(np.abs(zenith)))
+            else:
+                row = depth.shape[0] // 2
 
-ROS /cmd_vel remains available when:
-  ENABLE_WEBRTC_KEYBOARD_TELEOP = False
+            ranges = depth[row]
 
-Then you can use:
-  ros2 run teleop_twist_keyboard teleop_twist_keyboard
+            if azimuth.ndim == 1 and azimuth.size == ranges.size:
+                angles = azimuth
+            elif azimuth.size == depth.size:
+                angles = azimuth.reshape(depth.shape)[row]
+            else:
+                angles = np.linspace(
+                    -math.pi,
+                    math.pi,
+                    ranges.size,
+                    endpoint=False,
+                    dtype=np.float32,
+                )
+        else:
+            ranges = depth.reshape(-1)
+            angles = (
+                azimuth.reshape(-1)
+                if azimuth.size == ranges.size
+                else np.linspace(
+                    -math.pi,
+                    math.pi,
+                    ranges.size,
+                    endpoint=False,
+                    dtype=np.float32,
+                )
+            )
 
+        valid = np.isfinite(angles)
+        ranges = ranges[valid]
+        angles = angles[valid]
+        order = np.argsort(angles)
 
-If forward/backward or turning is reversed, change:
-  LEFT_WHEEL_SIGN
-  RIGHT_WHEEL_SIGN
-near the top of this file.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
+        return ranges[order], angles[order]
+
+    def publish_lidar(self, sim_time: float) -> None:
+        depth = self.lidar_interface.get_linear_depth_data(LIDAR)
+        azimuth = self.lidar_interface.get_azimuth_data(LIDAR)
+        zenith = self.lidar_interface.get_zenith_data(LIDAR)
+
+        ranges, angles = self.planar_scan(depth, azimuth, zenith)
+
+        if ranges.size >= 2:
+            message = LaserScan()
+            self.set_stamp(message.header.stamp, sim_time)
+            message.header.frame_id = FRAME_LIDAR
+            message.angle_min = float(angles[0])
+            message.angle_max = float(angles[-1])
+            message.angle_increment = float(np.median(np.diff(angles)))
+            message.scan_time = 1.0 / LIDAR_RATE
+            message.range_min = self.range_min
+            message.range_max = self.range_max
+
+            valid = (
+                np.isfinite(ranges)
+                & (ranges >= self.range_min)
+                & (ranges <= self.range_max)
+            )
+            message.ranges = np.where(
+                valid,
+                ranges,
+                np.inf,
+            ).astype(np.float32).tolist()
+
+            self.scan_pub.publish(message)
+
+        points = np.asarray(
+            self.lidar_interface.get_point_cloud_data(LIDAR),
+            dtype=np.float32,
         )
 
+        if not points.size:
+            return
 
-# =============================================================================
-# SCRIPT EDITOR ENTRY POINT
-# =============================================================================
+        points = points.reshape(-1, 3)
+        points = points[np.all(np.isfinite(points), axis=1)]
 
-async def _main() -> None:
-    global _DRNAV_ISAACSIM6_BRIDGE
+        message = PointCloud2()
+        self.set_stamp(message.header.stamp, sim_time)
+        message.header.frame_id = FRAME_LIDAR
+        message.height = 1
+        message.width = int(points.shape[0])
+        message.fields = [
+            PointField(
+                name="x",
+                offset=0,
+                datatype=PointField.FLOAT32,
+                count=1,
+            ),
+            PointField(
+                name="y",
+                offset=4,
+                datatype=PointField.FLOAT32,
+                count=1,
+            ),
+            PointField(
+                name="z",
+                offset=8,
+                datatype=PointField.FLOAT32,
+                count=1,
+            ),
+        ]
+        message.is_bigendian = False
+        message.point_step = 12
+        message.row_step = 12 * message.width
+        message.is_dense = True
+        message.data = np.asarray(points, dtype="<f4").tobytes()
 
-    try:
-        previous = _DRNAV_ISAACSIM6_BRIDGE
-    except NameError:
-        previous = None
+        self.points_pub.publish(message)
 
+    # ------------------------------------------------------------------
+    # Physics callback
+    # ------------------------------------------------------------------
+
+    def physics_step(self, dt, context) -> None:
+        del context
 
         try:
-            previous.shutdown()
-        except Exception as exc:
-            print("[DR.Nav] Previous bridge cleanup warning:", repr(exc))
+            rclpy.spin_once(self.ros_node, timeout_sec=0.0)
 
-    bridge = DRNavIsaacSim6Bridge()
-    _DRNAV_ISAACSIM6_BRIDGE = bridge
+            if USE_WEBRTC_KEYBOARD:
+                target_linear, target_angular = self.keyboard_command()
+            elif time.monotonic() - self.last_cmd_time > CMD_TIMEOUT:
+                target_linear, target_angular = 0.0, 0.0
+            else:
+                target_linear = self.cmd_linear
+                target_angular = self.cmd_angular
+
+            dt = max(float(dt), 0.0)
+
+            self.current_linear = move_toward(
+                self.current_linear,
+                target_linear,
+                MAX_LINEAR_ACCEL * dt,
+            )
+            self.current_angular = move_toward(
+                self.current_angular,
+                target_angular,
+                MAX_ANGULAR_ACCEL * dt,
+            )
+
+            self.set_wheel_targets(
+                self.current_linear,
+                self.current_angular,
+            )
+
+            now = self.sim_time()
+            self.publish_clock(now)
+
+            if (
+                self.last_odom_time < 0.0
+                or now - self.last_odom_time >= 1.0 / ODOM_RATE
+            ):
+                self.publish_odom(now)
+                self.last_odom_time = now
+
+            if (
+                self.last_lidar_time < 0.0
+                or now - self.last_lidar_time >= 1.0 / LIDAR_RATE
+            ):
+                self.publish_lidar(now)
+                self.last_lidar_time = now
+
+        except Exception as exc:
+            current = time.monotonic()
+
+            if current - self.last_error_print > 2.0:
+                print("[DR.Nav] Callback warning:", repr(exc))
+                self.last_error_print = current
+
+
+async def main() -> None:
+    previous = getattr(builtins, _BRIDGE_KEY, None)
+
+    if previous is not None:
+        try:
+            await previous.shutdown()
+        except Exception as exc:
+            print("[DR.Nav] Cleanup warning:", repr(exc))
+
+    bridge = DRNavBridge()
+    setattr(builtins, _BRIDGE_KEY, bridge)
 
     try:
         await bridge.start()
     except Exception:
-        bridge.shutdown()
+        try:
+            await bridge.shutdown()
+        finally:
+            setattr(builtins, _BRIDGE_KEY, None)
         raise
 
 
-asyncio.ensure_future(_main())
+asyncio.ensure_future(main())
+
