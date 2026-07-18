@@ -56,11 +56,24 @@ CAMERA = (
 
 LIDAR = f"{BASE}/sick_lms1xx_lidar_frame/Lidar"
 
-ZONE_GROUPS = [
-    # Highest priority first.
-    ("dead_end_terminal", 3, "/World/Zones/dead_end_terminal_zone"),
-    ("dead_end_branch", 2, "/World/Zones/dead_end_branch_zone"),
-    ("goal_path", 1, "/World/Zones/goal_path_zone"),
+# Zone cubes are discovered from their prim paths instead of assuming that
+# /World/Zones uses one exact hierarchy. Highest priority is listed first.
+ZONE_RULES = [
+    (
+        "dead_end_terminal",
+        3,
+        ("dead_end_terminal", "deadendterminal", "terminal_zone"),
+    ),
+    (
+        "dead_end_branch",
+        2,
+        ("dead_end_branch", "deadendbranch", "branch_zone"),
+    ),
+    (
+        "goal_path",
+        1,
+        ("goal_path", "goalpath", "path_zone"),
+    ),
 ]
 
 ZONE_OUTSIDE = ("outside", 0)
@@ -68,6 +81,11 @@ ZONE_OUTSIDE = ("outside", 0)
 RESOLUTION = (640, 480)
 CAPTURE_HZ = 10.0
 USE_Z_FOR_ZONE_TEST = True
+
+# Starting while paused is allowed. After playback has begun once, stopping the
+# timeline automatically closes the recorder and finalizes its resources.
+STOP_WHEN_TIMELINE_STOPS = True
+
 OUTPUT_ROOT = Path.home() / "drnav_dataset"
 
 RECORDER_KEY = "_DRNAV_REPLICATOR_RECORDER"
@@ -91,6 +109,7 @@ class DRNavRecorder:
 
         self.frame_id = 0
         self.next_capture_time = None
+        self.has_seen_playback = False
         self.zone_volumes = []
 
         self.previous_time = None
@@ -147,7 +166,13 @@ class DRNavRecorder:
     async def stop(self):
         self.running = False
 
-        if self.task is not None and not self.task.done():
+        current_task = asyncio.current_task()
+
+        if (
+            self.task is not None
+            and self.task is not current_task
+            and not self.task.done()
+        ):
             self.task.cancel()
             try:
                 await self.task
@@ -236,58 +261,73 @@ class DRNavRecorder:
     # ------------------------------------------------------------------
 
     def build_zone_index(self):
+        """Discover semantic Cube volumes anywhere in the stage."""
         cache = UsdGeom.BBoxCache(
             Usd.TimeCode.Default(),
             [UsdGeom.Tokens.default_],
             useExtentsHint=True,
         )
 
-        for label, zone_id, group_path in ZONE_GROUPS:
-            group = self.stage.GetPrimAtPath(group_path)
+        found_counts = {label: 0 for label, _, _ in ZONE_RULES}
+        zone_like_paths = []
 
-            if not group.IsValid():
-                print(
-                    "[DR.Nav Recorder] Missing zone group:",
-                    group_path,
-                )
+        for prim in self.stage.Traverse():
+            path = str(prim.GetPath())
+            normalized = path.lower().replace("-", "_").replace(" ", "_")
+
+            if any(
+                token in normalized
+                for token in ("zone", "dead_end", "deadend", "goal_path", "goalpath")
+            ):
+                zone_like_paths.append(path)
+
+            if prim.GetTypeName() != "Cube":
                 continue
 
-            found = 0
+            matched = None
 
-            for prim in Usd.PrimRange(group):
-                if prim == group or prim.GetTypeName() != "Cube":
-                    continue
+            for label, zone_id, aliases in ZONE_RULES:
+                if any(alias in normalized for alias in aliases):
+                    matched = (label, zone_id)
+                    break
 
-                world_bound = cache.ComputeWorldBound(prim)
-                aligned = world_bound.ComputeAlignedRange()
-                minimum = np.array(
-                    aligned.GetMin(),
-                    dtype=np.float64,
-                )
-                maximum = np.array(
-                    aligned.GetMax(),
-                    dtype=np.float64,
-                )
+            if matched is None:
+                continue
 
-                self.zone_volumes.append(
-                    {
-                        "label": label,
-                        "id": zone_id,
-                        "path": str(prim.GetPath()),
-                        "min": minimum,
-                        "max": maximum,
-                    }
-                )
-                found += 1
+            world_bound = cache.ComputeWorldBound(prim)
+            aligned = world_bound.ComputeAlignedRange()
 
+            self.zone_volumes.append(
+                {
+                    "label": matched[0],
+                    "id": matched[1],
+                    "path": path,
+                    "min": np.array(
+                        aligned.GetMin(),
+                        dtype=np.float64,
+                    ),
+                    "max": np.array(
+                        aligned.GetMax(),
+                        dtype=np.float64,
+                    ),
+                }
+            )
+            found_counts[matched[0]] += 1
+
+        for label, _, _ in ZONE_RULES:
             print(
                 f"[DR.Nav Recorder] {label}: "
-                f"{found} cube volume(s)"
+                f"{found_counts[label]} cube volume(s)"
             )
 
         if not self.zone_volumes:
+            print("[DR.Nav Recorder] Zone-like prims discovered:")
+            for path in zone_like_paths[:100]:
+                print("   ", path)
+
             raise RuntimeError(
-                "No zone cube volumes found under /World/Zones."
+                "No semantic zone Cube prims were matched. "
+                "Rename the zone cubes or add their path keywords to ZONE_RULES."
             )
 
     def zone_at(self, position):
@@ -396,7 +436,7 @@ class DRNavRecorder:
             "lidar_prim": LIDAR,
             "robot_base_prim": BASE,
             "zone_priority": [
-                item[0] for item in ZONE_GROUPS
+                item[0] for item in ZONE_RULES
             ],
             "use_z_for_zone_test": USE_Z_FOR_ZONE_TEST,
             "zone_ids": {
@@ -505,8 +545,26 @@ class DRNavRecorder:
 
             if not self.timeline.is_playing():
                 self.next_capture_time = None
+
+                if (
+                    STOP_WHEN_TIMELINE_STOPS
+                    and self.has_seen_playback
+                ):
+                    print(
+                        "[DR.Nav Recorder] Timeline stopped; "
+                        "closing recorder."
+                    )
+                    await self.stop()
+
+                    if getattr(builtins, RECORDER_KEY, None) is self:
+                        setattr(builtins, RECORDER_KEY, None)
+
+                    return
+
+                # If launched while paused, wait for the first Play event.
                 continue
 
+            self.has_seen_playback = True
             now = float(self.timeline.get_current_time())
 
             if self.next_capture_time is None:
