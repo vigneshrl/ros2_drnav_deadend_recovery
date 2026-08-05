@@ -16,13 +16,20 @@ import carb.input
 import omni.appwindow
 import omni.kit.app
 
+RUNTIME_CONFIG = getattr(builtins, "_DRNAV_RUNTIME_CONFIG", {})
+TOPIC_CONFIG = RUNTIME_CONFIG.get("topics", {})
+TELEOP_CONFIG = RUNTIME_CONFIG.get("teleop", {})
 
-CMD_TOPIC = "/cmd_vel"
-LINEAR_SPEED = 0.15
-ANGULAR_SPEED = 0.40
-PUBLISH_RATE_HZ = 30.0
+CMD_TOPIC = TOPIC_CONFIG.get("teleop_cmd", "/cmd_vel_teleop")
+LINEAR_SPEED = float(TELEOP_CONFIG.get("linear_speed", 0.15))
+ANGULAR_SPEED = float(TELEOP_CONFIG.get("angular_speed", 0.40))
+PUBLISH_RATE_HZ = float(TELEOP_CONFIG.get("publish_rate_hz", 30.0))
 
 BUILTINS_KEY = "_DRNAV_JACKAL_TELEOP"
+TASK_KEY = "_DRNAV_JACKAL_TELEOP_TASK"
+WAYPOINT_FOLLOWER_KEY = "_DRNAV_WAYPOINT_FOLLOWER"
+SENSOR_BRIDGE_KEY = "_DRNAV_ISAACSIM6_V6_BRIDGE"
+REQUIRED_COMMAND_INTERFACE_VERSION = 2
 
 
 class JackalTeleop:
@@ -38,8 +45,11 @@ class JackalTeleop:
         self.keys = set()
         self.publish_period = 1.0 / PUBLISH_RATE_HZ
         self.last_publish = 0.0
+        self.was_active = False
 
     async def start(self):
+        self.validate_sensor_bridge()
+        self.stop_waypoint_follower()
         await self.create_ros_publisher()
         self.create_keyboard()
         self.update_sub = (
@@ -51,7 +61,35 @@ class JackalTeleop:
             )
         )
         print("[DR.Nav Teleop] Ready. Click the viewport, then use W/S/A/D.")
-        print("[DR.Nav Teleop] Space stops. Publishing to /cmd_vel at 30 Hz.")
+        print(
+            "[DR.Nav Teleop] Space stops. Publishing active commands to "
+            "/cmd_vel_teleop at 30 Hz."
+        )
+
+    @staticmethod
+    def stop_waypoint_follower():
+        follower = getattr(builtins, WAYPOINT_FOLLOWER_KEY, None)
+        if follower is None:
+            return
+        try:
+            follower.shutdown()
+            print(
+                "[DR.Nav Teleop] Stopped waypoint follower; "
+                "teleop now owns robot control."
+            )
+        finally:
+            setattr(builtins, WAYPOINT_FOLLOWER_KEY, None)
+
+    @staticmethod
+    def validate_sensor_bridge():
+        bridge = getattr(builtins, SENSOR_BRIDGE_KEY, None)
+        version = getattr(bridge, "command_interface_version", None)
+        if version != REQUIRED_COMMAND_INTERFACE_VERSION:
+            raise RuntimeError(
+                "Run the current setup_sensors.py before setup_teleop.py. "
+                "The active sensor bridge does not support separated command "
+                "topics."
+            )
 
     async def create_ros_publisher(self):
         manager = omni.kit.app.get_app().get_extension_manager()
@@ -81,6 +119,9 @@ class JackalTeleop:
         )
 
     def on_key_event(self, event):
+        if getattr(builtins, BUILTINS_KEY, None) is not self:
+            return False
+
         allowed = {
             carb.input.KeyboardInput.W,
             carb.input.KeyboardInput.A,
@@ -121,11 +162,19 @@ class JackalTeleop:
         return linear, angular
 
     def on_update(self, _event):
+        if getattr(builtins, BUILTINS_KEY, None) is not self:
+            return
+
+        active = bool(self.keys)
+        if not active and not self.was_active:
+            return
+
         now = time.monotonic()
         if now - self.last_publish < self.publish_period:
             return
         self.last_publish = now
         self.publish(*self.command())
+        self.was_active = active
 
     def publish(self, linear, angular):
         if self.publisher is None:
@@ -169,11 +218,15 @@ async def main():
     setattr(builtins, BUILTINS_KEY, teleop)
     try:
         await teleop.start()
-    except Exception:
+    except BaseException:
         teleop.shutdown()
         if getattr(builtins, BUILTINS_KEY, None) is teleop:
             delattr(builtins, BUILTINS_KEY)
         raise
 
+previous_task = getattr(builtins, TASK_KEY, None)
+if previous_task is not None and not previous_task.done():
+    previous_task.cancel()
 
-asyncio.ensure_future(main())
+task = asyncio.ensure_future(main())
+setattr(builtins, TASK_KEY, task)
