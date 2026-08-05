@@ -2,8 +2,8 @@
 """Isaac Sim 6.0 DR.Nav setup for the current Jackal scene."""
 
 import asyncio, builtins, math, time
-import carb.input, numpy as np
-import omni.appwindow, omni.graph.core as og, omni.kit.app
+import numpy as np
+import omni.graph.core as og, omni.kit.app
 import omni.timeline, omni.usd
 from pxr import Usd, UsdGeom
 
@@ -27,9 +27,6 @@ BASE_FRAME = "base_link"
 CAM_FRAME_ID = "bumblebee_stereo_left_frame"
 LIDAR_FRAME_ID = "sim_lidar"
 
-USE_KEYBOARD = True
-LINEAR_SPEED = 0.15
-ANGULAR_SPEED = 0.40
 LINEAR_ACCEL = 0.35
 ANGULAR_ACCEL = 0.90
 WHEEL_RADIUS = 0.098
@@ -62,8 +59,6 @@ class Bridge:
         self.timeline = omni.timeline.get_timeline_interface()
         self.node = self.cmd_sub = self.lidar = self.robot = None
         self.wheel_ids = self.callback = None
-        self.input = self.keyboard = self.keyboard_sub = None
-        self.keys = set()
         self.cmd_v = self.cmd_w = self.v = self.w = 0.0
         self.last_cmd = time.monotonic()
         self.last_odom = self.last_lidar = -1.0
@@ -97,7 +92,6 @@ class Bridge:
         self.disable_lidar_debug()
         self.create_camera_graph()
         self.create_ros()
-        self.create_keyboard()
         self.timeline.play()
 
         for _ in range(6):
@@ -109,8 +103,9 @@ class Bridge:
         self.callback = SimulationManager.register_callback(
             self.step, IsaacEvents.POST_PHYSICS_STEP
         )
-        print("\n[DR.Nav] Small setup complete.")
-        print("[DR.Nav] W/S move, A/D turn, Space stops.")
+        print("\n[DR.Nav] Sensor and base bridge setup complete.")
+        print("[DR.Nav] Wheel control source: ROS 2 /cmd_vel")
+        print("[DR.Nav] Run setup_teleop.py for WebRTC keyboard control.")
         print("[DR.Nav] Wheel indices:", self.wheel_ids)
 
     async def shutdown(self):
@@ -128,20 +123,12 @@ class Bridge:
             self.set_wheels(0.0, 0.0)
         except Exception:
             pass
-        if self.input and self.keyboard and self.keyboard_sub is not None:
-            try:
-                self.input.unsubscribe_to_keyboard_events(
-                    self.keyboard, self.keyboard_sub
-                )
-            except Exception:
-                pass
         if self.node:
             try:
                 self.node.destroy_node()
             except Exception:
                 pass
-        self.node = self.keyboard_sub = None
-        self.keys.clear()
+        self.node = None
         await self.remove_graph()
         print("[DR.Nav] Previous small bridge cleaned up.")
 
@@ -254,58 +241,9 @@ class Bridge:
         self.tf_pub = TransformBroadcaster(self.node)
         self.static_tf_pub = StaticTransformBroadcaster(self.node)
 
-    def create_keyboard(self):
-        if not USE_KEYBOARD:
-            return
-        window = omni.appwindow.get_default_app_window()
-        if window is None:
-            raise RuntimeError("Isaac Sim app window unavailable.")
-        self.keyboard = window.get_keyboard()
-        self.input = carb.input.acquire_input_interface()
-        self.keyboard_sub = self.input.subscribe_to_keyboard_events(
-            self.keyboard, self.key_event
-        )
-
     def cmd_callback(self, msg):
         self.cmd_v, self.cmd_w = float(msg.linear.x), float(msg.angular.z)
         self.last_cmd = time.monotonic()
-
-    def key_event(self, event):
-        allowed = {
-            carb.input.KeyboardInput.W, carb.input.KeyboardInput.A,
-            carb.input.KeyboardInput.S, carb.input.KeyboardInput.D,
-            carb.input.KeyboardInput.SPACE,
-        }
-        if event.input not in allowed:
-            return False
-        if event.input == carb.input.KeyboardInput.SPACE:
-            if event.type in (
-                carb.input.KeyboardEventType.KEY_PRESS,
-                carb.input.KeyboardEventType.KEY_REPEAT,
-            ):
-                self.keys.clear()
-                self.v = self.w = 0.0
-                self.set_wheels(0.0, 0.0)
-            return True
-        if event.type in (
-            carb.input.KeyboardEventType.KEY_PRESS,
-            carb.input.KeyboardEventType.KEY_REPEAT,
-        ):
-            self.keys.add(event.input)
-        elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
-            self.keys.discard(event.input)
-        return True
-
-    def keyboard_cmd(self):
-        v = LINEAR_SPEED * (
-            int(carb.input.KeyboardInput.W in self.keys)
-            - int(carb.input.KeyboardInput.S in self.keys)
-        )
-        w = ANGULAR_SPEED * (
-            int(carb.input.KeyboardInput.A in self.keys)
-            - int(carb.input.KeyboardInput.D in self.keys)
-        )
-        return v, w
 
     def set_wheels(self, linear, angular):
         if self.robot is None or self.wheel_ids is None:
@@ -502,9 +440,7 @@ class Bridge:
     def step(self, dt, _context):
         try:
             rclpy.spin_once(self.node, timeout_sec=0.0)
-            if USE_KEYBOARD:
-                target_v, target_w = self.keyboard_cmd()
-            elif time.monotonic() - self.last_cmd > CMD_TIMEOUT:
+            if time.monotonic() - self.last_cmd > CMD_TIMEOUT:
                 target_v, target_w = 0.0, 0.0
             else:
                 target_v, target_w = self.cmd_v, self.cmd_w
@@ -549,4 +485,3 @@ async def main():
 
 
 asyncio.ensure_future(main())
-

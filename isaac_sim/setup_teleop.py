@@ -1,184 +1,179 @@
 #!/usr/bin/env python3
-"""
-Isaac Sim 4.5 — DR.Nav Teleop (Kinematic / Transform Control)
-==============================================================
-Run from: Isaac Sim → Window → Script Editor → Run
-Run AFTER setup_sensors.py (simulation must already be playing).
+"""WebRTC keyboard teleoperation for the DR.Nav Jackal.
 
-WHY KINEMATIC (not physics velocity)?
-  Every Isaac Sim 4.5 high-level API that sets rigid body velocity
-  (RigidPrim, get_physx_interface, dynamic_control) calls the same
-  internal physx interface that returns None unless you go through
-  World.reset() — which restarts the whole simulation.
+Run setup_sensors.py first, then run this file in Isaac Sim's Script Editor.
+Click the streamed viewport before using W/S/A/D. Space stops the robot.
 
-  Kinematic control directly writes the USD transform each physics step.
-  No physx interface needed. Zero chance of the NoneType error.
-
-  For DR.Nav experiments this is FINE because:
-    • LiDAR ray-casting works against geometry, not rigid bodies
-    • Camera rendering ignores physics state
-    • DR.Nav detects walls via sensors and steers around them
-    • PAD / NPR metrics only care about robot position over time
+This script only publishes geometry_msgs/Twist messages. Wheel actuation,
+acceleration limiting, and the command timeout remain in setup_sensors.py.
 """
 
-import math
-import rclpy
-from geometry_msgs.msg import Twist
-from pxr import Gf, UsdGeom, UsdPhysics
-from omni.isaac.core.utils.stage import get_current_stage
+import asyncio
+import builtins
+import time
 
-ROBOT_ROOT = "/World/Spot"
-
-# ── 1. ROS 2 subscriber ───────────────────────────────────────────────────────
-if not rclpy.ok():
-    rclpy.init()
-
-# Destroy old node if this script is re-run
-try:
-    _ros_node.destroy_node()   # noqa: F821
-except (NameError, Exception):
-    pass
-
-_ros_node     = rclpy.create_node("drnav_teleop_bridge")
-_latest_twist = Twist()
-
-def _cmd_vel_cb(msg: Twist):
-    global _latest_twist
-    _latest_twist = msg
-
-_ros_node.create_subscription(Twist, "/cmd_vel", _cmd_vel_cb, 10)
-print("[Teleop] Subscribed to /cmd_vel")
-
-# ── 2. Read Spot's initial pose from USD ──────────────────────────────────────
-# We integrate position ourselves, so we must start from wherever Spot
-# is placed in the scene, not from the origin.
-
-stage      = get_current_stage()
-robot_prim = stage.GetPrimAtPath(ROBOT_ROOT)
-xformable  = UsdGeom.Xformable(robot_prim)
-
-# Compute the current world transform (read-only, no physx needed)
-init_xf  = xformable.ComputeLocalToWorldTransform(0)
-init_pos = init_xf.ExtractTranslation()
-init_rot = init_xf.ExtractRotationMatrix()
-
-# Isaac Sim is Z-up, X-forward:
-#   rotation matrix column 0 = X-axis = forward direction in world space
-# atan2(rot[1][0], rot[0][0]) gives the yaw around Z
-_pos = [init_pos[0], init_pos[1], init_pos[2]]   # [x, y, z]
-_yaw = math.atan2(float(init_rot[1][0]), float(init_rot[0][0]))
-
-print(f"[Teleop] Initial position : ({_pos[0]:.2f}, {_pos[1]:.2f}, {_pos[2]:.2f})")
-print(f"[Teleop] Initial yaw      : {math.degrees(_yaw):.1f}°")
-
-# ── 3. Mark robot as kinematic so physics doesn't override our transform ──────
-# A kinematic rigid body still participates in collision detection for OTHER
-# objects but its own position is driven by the transform, not by forces.
-# If Spot has no RigidBodyAPI this step is silently skipped.
-
-rb_api = UsdPhysics.RigidBodyAPI(robot_prim)
-if rb_api:
-    rb_api.CreateKinematicEnabledAttr().Set(True)
-    print("[Teleop] Spot set to kinematic (transform-driven)")
-else:
-    print("[Teleop] No RigidBodyAPI on /World/Spot — skipping kinematic flag")
-
-# ── 4. Get the translate and rotate XformOps ──────────────────────────────────
-# Every USD prim that can be moved has XformOps (translate, rotate, scale).
-# We find the existing ones; if none exist we add them.
-
-def _find_or_create_ops(xformable, init_pos, init_yaw):
-    """Return (translate_op, orient_op) from the prim's XformOp stack."""
-    t_op = None
-    r_op = None
-
-    for op in xformable.GetOrderedXformOps():
-        ot = op.GetOpType()
-        if ot == UsdGeom.XformOp.TypeTranslate:
-            t_op = op
-        elif ot in (UsdGeom.XformOp.TypeOrient,
-                    UsdGeom.XformOp.TypeRotateXYZ,
-                    UsdGeom.XformOp.TypeRotateZ):
-            r_op = op
-
-    # Create missing ops
-    if t_op is None:
-        t_op = xformable.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionDouble)
-        t_op.Set(Gf.Vec3d(init_pos[0], init_pos[1], init_pos[2]))
-        print("[Teleop] Created TranslateOp")
-
-    if r_op is None:
-        r_op = xformable.AddOrientOp(precision=UsdGeom.XformOp.PrecisionDouble)
-        h = init_yaw / 2.0
-        r_op.Set(Gf.Quatd(math.cos(h), 0.0, 0.0, math.sin(h)))
-        print("[Teleop] Created OrientOp")
-
-    return t_op, r_op
-
-_translate_op, _orient_op = _find_or_create_ops(xformable, _pos, _yaw)
-_orient_type = _orient_op.GetOpType()
-
-# ── 5. Transform-update callback ──────────────────────────────────────────────
-def _teleop_step(dt: float):
-    global _pos, _yaw
-
-    # Non-blocking ROS spin — processes one queued message if available
-    rclpy.spin_once(_ros_node, timeout_sec=0)
-
-    lin = _latest_twist.linear.x    # m/s forward
-    ang = _latest_twist.angular.z   # rad/s yaw
-
-    # Nothing to do if no command
-    if abs(lin) < 1e-4 and abs(ang) < 1e-4:
-        return
-
-    # Integrate pose (simple Euler, dt ≈ 1/60 s is fine for this)
-    _yaw    += ang * dt
-    _pos[0] += lin * math.cos(_yaw) * dt
-    _pos[1] += lin * math.sin(_yaw) * dt
-
-    # Write translation — keep original Z so Spot stays on the floor
-    _translate_op.Set(Gf.Vec3d(_pos[0], _pos[1], _pos[2]))
-
-    # Write rotation — handle OrientOp (quaternion) or RotateXYZ (euler degrees)
-    if _orient_type == UsdGeom.XformOp.TypeOrient:
-        h = _yaw / 2.0
-        _orient_op.Set(Gf.Quatd(math.cos(h), 0.0, 0.0, math.sin(h)))
-    elif _orient_type in (UsdGeom.XformOp.TypeRotateXYZ,
-                          UsdGeom.XformOp.TypeRotateZ):
-        _orient_op.Set(Gf.Vec3f(0.0, 0.0, math.degrees(_yaw)))
-
-# ── 6. Register callback ──────────────────────────────────────────────────────
-# We use omni.kit.app update stream — fires every frame, no World needed.
-# This completely avoids all physx initialisation issues.
-
+import carb.input
+import omni.appwindow
 import omni.kit.app
 
-# Remove old subscription if re-running
-try:
-    _teleop_sub.unsubscribe()   # noqa: F821
-except (NameError, Exception):
-    pass
 
-_teleop_sub = omni.kit.app.get_app() \
-    .get_update_event_stream() \
-    .create_subscription_to_pop(
-        lambda e: _teleop_step(e.payload.get("dt", 1/60)),
-        name="drnav_teleop"
-    )
+CMD_TOPIC = "/cmd_vel"
+LINEAR_SPEED = 0.15
+ANGULAR_SPEED = 0.40
+PUBLISH_RATE_HZ = 30.0
 
-print("[Teleop] Update callback registered — /cmd_vel now controls Spot")
-print("""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Test teleop (new terminal):
-  source /opt/ros/humble/setup.bash
-  ros2 run teleop_twist_keyboard teleop_twist_keyboard
+BUILTINS_KEY = "_DRNAV_JACKAL_TELEOP"
 
-  i / , = forward / backward
-  j / l = turn left / right
-  k     = stop
 
-Then launch DR.Nav:
-  ros2 launch map_contruct mapless.launch.py method:=dram
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-""")
+class JackalTeleop:
+    def __init__(self):
+        self.rclpy = None
+        self.twist_type = None
+        self.node = None
+        self.publisher = None
+        self.input = None
+        self.keyboard = None
+        self.keyboard_sub = None
+        self.update_sub = None
+        self.keys = set()
+        self.publish_period = 1.0 / PUBLISH_RATE_HZ
+        self.last_publish = 0.0
+
+    async def start(self):
+        await self.create_ros_publisher()
+        self.create_keyboard()
+        self.update_sub = (
+            omni.kit.app.get_app()
+            .get_update_event_stream()
+            .create_subscription_to_pop(
+                self.on_update,
+                name="DR.Nav Jackal teleop publisher",
+            )
+        )
+        print("[DR.Nav Teleop] Ready. Click the viewport, then use W/S/A/D.")
+        print("[DR.Nav Teleop] Space stops. Publishing to /cmd_vel at 30 Hz.")
+
+    async def create_ros_publisher(self):
+        manager = omni.kit.app.get_app().get_extension_manager()
+        manager.set_extension_enabled_immediate("isaacsim.ros2.bridge", True)
+        for _ in range(3):
+            await omni.kit.app.get_app().next_update_async()
+
+        import rclpy
+        from geometry_msgs.msg import Twist
+
+        self.rclpy = rclpy
+        self.twist_type = Twist
+        if not rclpy.ok():
+            rclpy.init()
+        self.node = rclpy.create_node("drnav_jackal_teleop")
+        self.publisher = self.node.create_publisher(Twist, CMD_TOPIC, 10)
+
+    def create_keyboard(self):
+        window = omni.appwindow.get_default_app_window()
+        if window is None:
+            raise RuntimeError("Isaac Sim app window unavailable.")
+        self.keyboard = window.get_keyboard()
+        self.input = carb.input.acquire_input_interface()
+        self.keyboard_sub = self.input.subscribe_to_keyboard_events(
+            self.keyboard,
+            self.on_key_event,
+        )
+
+    def on_key_event(self, event):
+        allowed = {
+            carb.input.KeyboardInput.W,
+            carb.input.KeyboardInput.A,
+            carb.input.KeyboardInput.S,
+            carb.input.KeyboardInput.D,
+            carb.input.KeyboardInput.SPACE,
+        }
+        if event.input not in allowed:
+            return False
+
+        if event.input == carb.input.KeyboardInput.SPACE:
+            if event.type in (
+                carb.input.KeyboardEventType.KEY_PRESS,
+                carb.input.KeyboardEventType.KEY_REPEAT,
+            ):
+                self.keys.clear()
+                self.publish(0.0, 0.0)
+            return True
+
+        if event.type in (
+            carb.input.KeyboardEventType.KEY_PRESS,
+            carb.input.KeyboardEventType.KEY_REPEAT,
+        ):
+            self.keys.add(event.input)
+        elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
+            self.keys.discard(event.input)
+        return True
+
+    def command(self):
+        linear = LINEAR_SPEED * (
+            int(carb.input.KeyboardInput.W in self.keys)
+            - int(carb.input.KeyboardInput.S in self.keys)
+        )
+        angular = ANGULAR_SPEED * (
+            int(carb.input.KeyboardInput.A in self.keys)
+            - int(carb.input.KeyboardInput.D in self.keys)
+        )
+        return linear, angular
+
+    def on_update(self, _event):
+        now = time.monotonic()
+        if now - self.last_publish < self.publish_period:
+            return
+        self.last_publish = now
+        self.publish(*self.command())
+
+    def publish(self, linear, angular):
+        if self.publisher is None:
+            return
+        message = self.twist_type()
+        message.linear.x = float(linear)
+        message.angular.z = float(angular)
+        self.publisher.publish(message)
+
+    def shutdown(self):
+        self.keys.clear()
+        self.publish(0.0, 0.0)
+        self.update_sub = None
+
+        if self.input is not None and self.keyboard_sub is not None:
+            try:
+                self.input.unsubscribe_to_keyboard_events(
+                    self.keyboard,
+                    self.keyboard_sub,
+                )
+            except Exception:
+                pass
+            self.keyboard_sub = None
+
+        if self.node is not None:
+            try:
+                self.node.destroy_node()
+            except Exception:
+                pass
+            self.node = None
+        self.publisher = None
+        print("[DR.Nav Teleop] Stopped and published a zero command.")
+
+
+async def main():
+    previous = getattr(builtins, BUILTINS_KEY, None)
+    if previous is not None:
+        previous.shutdown()
+
+    teleop = JackalTeleop()
+    setattr(builtins, BUILTINS_KEY, teleop)
+    try:
+        await teleop.start()
+    except Exception:
+        teleop.shutdown()
+        if getattr(builtins, BUILTINS_KEY, None) is teleop:
+            delattr(builtins, BUILTINS_KEY)
+        raise
+
+
+asyncio.ensure_future(main())
