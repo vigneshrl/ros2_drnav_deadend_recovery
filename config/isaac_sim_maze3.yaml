@@ -1,0 +1,62 @@
+# DR.Nav Isaac Sim runtime configuration for the Maze3/Maze1 layout.
+# Relative paths are resolved from this config directory.
+project_root: ..
+expected_maze: Maze3
+allow_other_mazes: false
+
+# Valid values: waypoint, teleop, none
+control_mode: waypoint
+
+topics:
+  image: /argus/ar0234_front_left/image_raw
+  scan: /scan
+  points: /os_cloud_node/points
+  odom: /odom_lidar
+  clock: /clock
+  direct_cmd: /cmd_vel
+  teleop_cmd: /cmd_vel_teleop
+  waypoint_cmd: /cmd_vel_waypoint
+
+base_control:
+  linear_accel: 0.35
+  angular_accel: 0.90
+  command_timeout: 0.5
+  odom_rate_hz: 30.0
+  lidar_rate_hz: 10.0
+
+teleop:
+  linear_speed: 0.15
+  angular_speed: 0.40
+  publish_rate_hz: 30.0
+
+waypoint_follower:
+  control_rate_hz: 20.0
+  waypoint_tolerance: 0.35
+  final_tolerance: 0.45
+  max_linear_speed: 0.35
+  min_linear_speed: 0.08
+  max_angular_speed: 0.60
+  linear_gain: 0.65
+  angular_gain: 1.50
+  rotate_in_place_degrees: 25.0
+  slowdown_degrees: 10.0
+
+  # Spawn -> west dead end -> north dead end -> south goal.
+  waypoints:
+    - {name: west_dead_end, x: -8.80, y: 0.15}
+    - {name: central_junction_after_west, x: -1.70, y: 0.10}
+    - {name: north_dead_end, x: -1.70, y: 24.50}
+    - {name: central_junction_after_north, x: -1.70, y: 0.10}
+    - {name: south_goal, x: -1.70, y: -29.50}
+
+recorder:
+  enabled: true
+  debug_stop_state: false
+  output_root: ~/drnav_dataset
+  capture_hz: 10.0
+  resolution: [640, 480]
+  warmup_updates: 5
+  require_lidar_data: true
+  minimum_lidar_coverage: 0.95
+  max_lidar_slices: 12
+  use_z_for_zone_test: true
