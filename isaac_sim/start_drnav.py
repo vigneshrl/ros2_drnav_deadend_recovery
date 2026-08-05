@@ -183,6 +183,7 @@ async def start_runtime():
             isaac_dir / "setup_teleop.py",
             isaac_dir / "setup_waypoint_follower.py",
             isaac_dir / "episode_recorder.py",
+            isaac_dir / "dataset_recorder.py",
         ]
         missing = [str(path) for path in required if not path.is_file()]
         if missing:
